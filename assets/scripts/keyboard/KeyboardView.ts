@@ -28,14 +28,12 @@ export const MAX_KEY_WIDTH = 48;
  * 对应 M3-2。命中测试与力度计算不在这里（见 TouchRouter），
  * 本组件只负责「把一个 KeyLayout 画出来」和「记录哪些键是按下的」。
  *
- * ## 为什么要分两层 Graphics
+ * ## 绘制方式
  *
- * 88 个键若每次按下都整体重绘，一次触键就要重建上百个矩形。这里拆成：
- *   - `_baseLayer`    静态键面，只在尺寸变化时重绘
- *   - `_pressLayer`   只画按下的键，每次按键变化重绘（通常 0–10 个矩形）
- *
- * 另外用 Graphics 批量绘制而不是每键一个 Sprite 节点 —— 后者是 88 个节点
+ * 用 Graphics 批量绘制而不是每键一个 Sprite 节点 —— 后者是 88 个节点
  * 外加 88 个 UITransform，DrawCall 与遍历开销都不可接受（见方案 §7.3）。
+ *
+ * 整屏在**一个** Graphics 里画（为什么不是两层，见 `_layer` 的说明）。
  */
 @ccclass('KeyboardView')
 export class KeyboardView extends Component {
@@ -75,8 +73,17 @@ export class KeyboardView extends Component {
     whiteKeyOutlineColor = COLOR_SEPARATOR.clone();
 
     private _layout!: KeyLayout;
-    private _baseLayer!: Graphics;
-    private _pressLayer!: Graphics;
+
+    /**
+     * 绘制层。
+     *
+     * **只有一层。** 曾经拆成「静态键面 + 按下高亮」两层来省重绘开销，
+     * 但两层之间的绘制顺序会互相干扰：按下层在基础层之上，白键高亮画全高
+     * 就会糊住压在它上面的黑键；而补画黑键又引出了新的状态问题。
+     * 合并成一层后，所有元素在同一个序列里画，顺序天然正确，
+     * 代价只是每次按键状态变化重绘一次整屏 —— 一百多个矩形，完全可以接受。
+     */
+    private _layer!: Graphics;
     private _pressed = new Set<number>();
     private _offsetX = 0;
     private _viewportWidth = 0;
@@ -131,16 +138,14 @@ export class KeyboardView extends Component {
             whiteKeyHeight: this.whiteKeyHeight,
         });
 
-        if (!this._baseLayer) {
-            this._baseLayer = this.makeLayer('BaseLayer');
-            this._pressLayer = this.makeLayer('PressLayer');
+        if (!this._layer) {
+            this._layer = this.makeLayer('Keyboard');
         }
 
         this.syncTransform();
         this._pressed.clear();
         this.syncViewport();
-        this.drawBase();
-        this.drawPress();
+        this.redraw();
     }
 
     /**
@@ -268,37 +273,89 @@ export class KeyboardView extends Component {
 
     // ---------------------------------------------------------------- 绘制
 
-    private drawBase(): void {
-        const g = this._baseLayer;
+    /**
+     * 重绘整屏。
+     *
+     * 每次按键状态变化都整体重绘 —— 单层之下没有别的选择，也确实不需要：
+     * 一百多个矩形重绘一次的开销，远小于维护两层之间顺序正确性的代价。
+     *
+     * ## 绘制顺序（不可调换）
+     *
+     *   1. 白键（未按下 / 按下各刷一遍）
+     *   2. 白键分隔线 —— 必须在黑键**之前**
+     *   3. 黑键（未按下 / 按下各刷一遍）
+     *
+     * 第 2 步的位置是硬约束：黑键**跨在白键的分界线上**，分隔线正好穿过它的
+     * 正中间。若画在黑键之后，每个黑键上都会多出一道灰线；画在前面，黑键填色
+     * 自然就把该挡住的那段盖住了。
+     */
+    private redraw(): void {
+        const g = this._layer;
         g.clear();
 
         // 视口裁剪：只画看得见的键
-        const x0 = -this._offsetX - this.keyWidth;
-        const x1 = x0 + this._viewportWidth + this.keyWidth * 2;
+        const [x0, x1] = this.visibleRange();
         const visible = this._layout.getVisibleKeys(x0, x1);
 
-        // 白键先画
-        g.fillColor = COLOR_WHITE_KEY;
-        for (const key of visible) {
-            if (!key.isBlack) {
-                g.rect(key.x, 0, key.width, key.height);
-            }
-        }
-        g.fill();
+        // 按下的键直接换填充色，而不是在上面叠一层高亮。
+        // 单层里没有「叠」这回事，换色天然不会波及压在它上面的黑键 ——
+        // 正是这一点让两层方案可以被合掉。
+        const down = (key: KeyGeometry): boolean => this._pressed.has(key.midi);
 
-        // 分隔线画在白键之后、黑键之前。
-        //
-        // ⚠️ 顺序很关键：黑键**跨在白键的分界线上**，分隔线正好穿过它的正中间。
-        // 如果在黑键之后画，每个黑键上都会多出一道灰线；画在前面，黑键填色
-        // 自然就把该挡住的那段盖住了。
+        this.fillKeys(g, visible, (key) => !key.isBlack && !down(key), COLOR_WHITE_KEY);
+        this.fillKeys(g, visible, (key) => !key.isBlack && down(key), COLOR_WHITE_PRESSED);
+
         this.strokeSeparators(g, visible);
 
-        // 黑键最后画，压在白键与分隔线之上
-        g.fillColor = COLOR_BLACK_KEY;
-        for (const key of visible) {
-            if (key.isBlack) {
-                g.rect(key.x, this._layout.whiteKeyHeight - key.height, key.width, key.height);
-            }
+        this.fillKeys(g, visible, (key) => key.isBlack && !down(key), COLOR_BLACK_KEY);
+        this.fillKeys(g, visible, (key) => key.isBlack && down(key), COLOR_BLACK_PRESSED);
+    }
+
+    /**
+     * 用同一种颜色填充符合 `pick` 的键。
+     *
+     * 同色的矩形攒在一条路径里一次 `fill()`，绘制开销与按下的键数无关 ——
+     * 逐个 `rect` + `fill` 会让十指按下时多出十次绘制。
+     *
+     * ## ⚠️ 一个键都没选中时必须直接返回，不能继续走到 `fill()`
+     *
+     * 这不是省一次空绘制，**是正确性问题**。Cocos 的 `Graphics` 里 `fill()`
+     * 只是打一个「已消费」标记，真正推进消费位置的是**下一次 `rect()`** ——
+     * `rect()` 的第一件事就是 `moveTo()`，而 `moveTo()` 才会执行
+     * `pathOffset = pathLength`：
+     *
+     * ```js
+     * moveTo (x, y) {
+     *     if (this.updatePathOffset) { this.pathOffset = this.pathLength; this.updatePathOffset = false; }
+     *     ...
+     * }
+     * fill () { this._expandFill(this); this.impl.updatePathOffset = true; }
+     * ```
+     *
+     * 所以一次「前面没有任何 `rect()`」的 `fill()`，会把**上一次 `fill()` 已经
+     * 画过的路径**用新颜色**重刷一遍**。曾经这里没有这个提前返回：开机时按下的
+     * 键集为空，两批「按下态」都是零矩形，于是白键被重刷成按下浅蓝、黑键被重刷
+     * 成按下深蓝 —— 整块键盘一片蓝，而分隔线是 `stroke()` 画的、刚好在两者之间
+     * 消费掉了路径，所以键的轮廓还在。症状是「琴键在，但是蓝的」。
+     */
+    private fillKeys(
+        g: Graphics,
+        visible: readonly KeyGeometry[],
+        pick: (key: KeyGeometry) => boolean,
+        color: Color,
+    ): void {
+        const whiteTop = this._layout.whiteKeyHeight;
+
+        // 先挑出要画的键。空批次绝不能落到下面的 fill()
+        const keys = visible.filter(pick);
+        if (keys.length === 0) {
+            return;
+        }
+
+        g.fillColor = color;
+        for (const key of keys) {
+            // 黑键从白键顶端往下长，白键则铺满整个高度
+            g.rect(key.x, key.isBlack ? whiteTop - key.height : 0, key.width, key.height);
         }
         g.fill();
     }
@@ -335,34 +392,14 @@ export class KeyboardView extends Component {
         g.stroke();
     }
 
-    private drawPress(): void {
-        const g = this._pressLayer;
-        g.clear();
-        if (this._pressed.size === 0) {
-            return;
-        }
-
-        const whiteTop = this._layout.whiteKeyHeight;
-
-        // 白键高亮
-        g.fillColor = COLOR_WHITE_PRESSED;
-        for (const midi of this._pressed) {
-            const key = this._layout.getKey(midi);
-            if (key && !key.isBlack) {
-                g.rect(key.x, 0, key.width, key.height);
-            }
-        }
-        g.fill();
-
-        // 黑键高亮（覆盖在白键高亮之上）
-        g.fillColor = COLOR_BLACK_PRESSED;
-        for (const midi of this._pressed) {
-            const key = this._layout.getKey(midi);
-            if (key && key.isBlack) {
-                g.rect(key.x, whiteTop - key.height, key.width, key.height);
-            }
-        }
-        g.fill();
+    /**
+     * 当前视口对应的键盘内容坐标范围（左右各留一个键宽余量）。
+     *
+     * 基础层与按下层都要用它做裁剪，抽出来避免两处各算一遍、算得不一致。
+     */
+    private visibleRange(): [number, number] {
+        const x0 = -this._offsetX - this.keyWidth;
+        return [x0, x0 + this._viewportWidth + this.keyWidth * 2];
     }
 
     // ---------------------------------------------------------------- 按下状态
@@ -378,7 +415,7 @@ export class KeyboardView extends Component {
         } else {
             this._pressed.delete(midi);
         }
-        this.drawPress();
+        this.redraw();
     }
 
     /** 清空全部按下状态（如触摸被系统中断时）。 */
@@ -387,7 +424,7 @@ export class KeyboardView extends Component {
             return;
         }
         this._pressed.clear();
-        this.drawPress();
+        this.redraw();
     }
 
     /** 当前按下的键（只读） */
