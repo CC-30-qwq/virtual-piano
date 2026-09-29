@@ -65,6 +65,12 @@ audio-src/
 # C++ 内核测试的构建产物
 #//////////////////////////
 tests/cpp/.build/
+# syntax_check.sh 的 .obj 输出。原本漏了这一条，于是这些 .obj 被提交进了仓库，
+# 每次跑测试都会在 git status 里刷出一片「已修改」。
+tests/cpp/.syntax/
+# 一次性基准（dr_flac 解码吞吐）。源码留着方便复测，产物不入库。
+tests/cpp/.bench/*.exe
+tests/cpp/.bench/*.obj
 
 #//////////////////////////
 # 音源流水线产物

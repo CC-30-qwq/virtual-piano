@@ -52,6 +52,14 @@ bool SamplePool::commit(uint32_t frames) noexcept {
     return true;
 }
 
+bool SamplePool::setCommitted(size_t frames) noexcept {
+    if (frames > _capacityFrames) {
+        return false;
+    }
+    _cursorFrames = frames;
+    return true;
+}
+
 void SamplePool::release() noexcept {
     _data.reset();
     _capacityFrames = 0;

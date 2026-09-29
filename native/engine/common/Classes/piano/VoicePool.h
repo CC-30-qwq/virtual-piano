@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 #include "PianoParams.h"   // kMaxVoices
@@ -37,11 +38,27 @@ public:
     VoicePool(const VoicePool&)            = delete;
     VoicePool& operator=(const VoicePool&) = delete;
 
-    /** 绑定音源库。必须在任何 noteOn 之前调用。 */
-    void setBank(SampleBank* bank) { _bank = bank; }
+    /**
+     * 绑定音源库。
+     *
+     * ⚠️ **这是载入线程 → 音频线程的发布点**，所以是 release 语义：
+     * 调用之前对银行、内存池做的全部写入（含采样层指针、池的常驻长度），
+     * 在看到这只指针的线程那里都是可见的。改成裸指针赋值会在 ARM 上
+     * 偶发「读到了新银行、却读到半成品层指针」—— 表现为随机崩溃或杂音。
+     *
+     * 必须在任何 noteOn 之前调用（绑定之前 noteOn 直接返回，不会读野指针）。
+     */
+    void setBank(SampleBank* bank) { _bank.store(bank, std::memory_order_release); }
 
-    /** 通知设备采样率（释放斜坡的时长按它换算） */
-    void setSampleRate(int32_t sampleRate) { _sampleRate = sampleRate > 0 ? sampleRate : 48000; }
+    /**
+     * 通知设备采样率（释放斜坡的时长按它换算）。
+     *
+     * 原子量：载入完成时会由载入线程再设一次（用设备实际生效的采样率）。
+     * 这只是个标量，relaxed 读写足够，不需要跟别的字段一起排序。
+     */
+    void setSampleRate(int32_t sampleRate) {
+        _sampleRate.store(sampleRate > 0 ? sampleRate : 48000, std::memory_order_relaxed);
+    }
 
     /**
      * 触发一个音。
@@ -72,13 +89,14 @@ private:
     /** 找一个可用的 voice；没有空闲的就按策略偷一个 */
     Voice* allocate();
 
-    /** 由力度算出层内增益 */
-    float velocityGain(uint8_t velocity) const;
+    /** 由力度算出层内增益。银行由调用方传入 —— 见 `noteOn` 里的 acquire 快照 */
+    float velocityGain(const SampleBank* bank, uint8_t velocity) const;
 
     void applyPedalRelease();
 
-    SampleBank* _bank = nullptr;
-    int32_t _sampleRate = 48000;
+    /** 见 `setBank`：跨线程发布，必须是原子量 */
+    std::atomic<SampleBank*> _bank{nullptr};
+    std::atomic<int32_t> _sampleRate{48000};
 
     Voice _voices[kMaxVoices];
     uint32_t _frameCounter = 0;

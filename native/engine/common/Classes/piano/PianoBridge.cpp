@@ -83,18 +83,25 @@ void jsbSetParam(int32_t id, float value) {
 // ---------------------------------------------------------------- 音源包
 
 /**
- * 载入音源包。
+ * 发起载入音源包。**异步** —— 立即返回，解码在后台线程上进行。
  *
  * @param layerMask 要常驻的力度层掩码（位 0..15 对应层 1..16）。
- *        传 -1 或 0xFFFF 表示全 16 层，约 250MB —— 低内存机型应传更小的值。
- * @return 是否成功
+ *        传 -1 或 0xFFFF 表示全 16 层，约 250MB。
+ *        ⚠️ 传更小的值会**降低音质**（未常驻的层由相邻层顶替），当前不接受。
+ * @return 是否已受理（1）／已在载或起不了线程（0）
  *
- * ⚠️ 这是**同步阻塞**的，要读完并解码几百 MB，中端机几秒。TS 侧必须放在
- * 启动流程里、且不要挡住首帧渲染，否则会被系统判为无响应。
+ * 是否真的载好要用 `getLoadProgress` 查。返回值只表示「请求被接受了」，
+ * 不是「已经能发声」—— 早先它的语义是「同步载完了」，改成异步之后
+ * 若沿用旧语义，TS 侧会把「刚开始载」误当成「已就绪」。
  */
 int32_t jsbLoadBank(int32_t layerMask) {
     const uint16_t mask = layerMask < 0 ? 0xFFFF : static_cast<uint16_t>(layerMask & 0xFFFF);
     return sharedEngine().loadBank(mask) ? 1 : 0;
+}
+
+/** 载入进度：-2 失败 / -1 未开始 / 0..99 进行中 / 100 已完成 */
+int32_t jsbGetLoadProgress() {
+    return sharedEngine().loadProgress();
 }
 
 double jsbGetResidentBytes() {
@@ -154,6 +161,7 @@ bool jsb_register_piano(se::Object* globalThis) {
         .staticFunction("submitEvents", &jsbSubmitEvents)
         .staticFunction("setParam", &jsbSetParam)
         .staticFunction("loadBank", &jsbLoadBank)
+        .staticFunction("getLoadProgress", &jsbGetLoadProgress)
         .staticFunction("getResidentBytes", &jsbGetResidentBytes)
         .staticFunction("getActiveVoices", &jsbGetActiveVoices)
         .staticFunction("getXrunCount", &jsbGetXrunCount)

@@ -18,21 +18,27 @@ float clampf(float v, float lo, float hi) {
 }  // namespace
 
 void VoicePool::noteOn(uint8_t midi, uint8_t velocity, uint32_t startFrame) {
-    if (_bank == nullptr || !_bank->loaded()) {
+    // acquire 一次、用局部指针 —— 见 `setBank` 的说明。
+    // 顺带也省掉了后面每次访问都做一次原子读。
+    SampleBank* const bank = _bank.load(std::memory_order_acquire);
+    if (bank == nullptr || !bank->loaded()) {
+        // 还没载入音源（或正在后台载入）。此时按下去无声是预期行为。
         return;
     }
 
-    const RootNote* root = _bank->findRoot(midi);
+    const RootNote* root = bank->findRoot(midi);
     if (root == nullptr) {
         return;
     }
 
-    const SampleLayer* layer = _bank->findLayer(*root, velocity);
+    const SampleLayer* layer = bank->findLayer(*root, velocity);
     if (layer == nullptr || !layer->resident()) {
         // 该根音一个层都没载入。宁可不出声也不要读野指针 ——
         // 载入是分档的，低端机上确实可能整片没载入。
         return;
     }
+
+    const int32_t sampleRate = _sampleRate.load(std::memory_order_relaxed);
 
     // 同一个音重新触发时，把之前那个（未挂起的）先放掉。
     // 真实钢琴重击同一根弦时，旧振动会被新的取代；不处理的话两个音会叠起来，
@@ -40,7 +46,7 @@ void VoicePool::noteOn(uint8_t midi, uint8_t velocity, uint32_t startFrame) {
     for (int i = 0; i < kMaxVoices; ++i) {
         Voice& v = _voices[i];
         if (v.isActive() && !v.isReleasing() && !_sustained[i] && v.midi() == midi) {
-            v.release(0.03f, _sampleRate);
+            v.release(0.03f, sampleRate);
         }
     }
 
@@ -51,18 +57,18 @@ void VoicePool::noteOn(uint8_t midi, uint8_t velocity, uint32_t startFrame) {
 
     // 采样是按小三度铺的，这里把音高差换算成播放速率
     const double ratio = playbackRatio(static_cast<int32_t>(midi), root->midi,
-                                       _bank->sampleRate(), _sampleRate);
+                                       bank->sampleRate(), sampleRate);
 
-    voice->start(*layer, ratio, velocityGain(velocity), midi, startFrame);
+    voice->start(*layer, ratio, velocityGain(bank, velocity), midi, startFrame);
 }
 
-float VoicePool::velocityGain(uint8_t velocity) const {
+float VoicePool::velocityGain(const SampleBank* bank, uint8_t velocity) const {
     // 层选择已经把大跨度的动态分掉了（16 层），这里只做**层内的微调**。
     //
     // 层内的力度差映射到 ±3 dB。不做成完整的力度平方律 —— 那会和采样本身
     // 已经录好的动态叠加，同一层内从最轻弹到最响会拉开几十 dB，明显不对。
     const VelocityRange* range = nullptr;
-    for (const VelocityRange& r : _bank->velocityRanges()) {
+    for (const VelocityRange& r : bank->velocityRanges()) {
         if (velocity >= r.minVelocity && velocity <= r.maxVelocity) {
             range = &r;
             break;
@@ -81,6 +87,8 @@ float VoicePool::velocityGain(uint8_t velocity) const {
 }
 
 void VoicePool::noteOff(uint8_t midi) {
+    const int32_t sampleRate = _sampleRate.load(std::memory_order_relaxed);
+
     for (int i = 0; i < kMaxVoices; ++i) {
         Voice& v = _voices[i];
         if (!v.isActive() || v.isReleasing() || v.midi() != midi) {
@@ -91,7 +99,7 @@ void VoicePool::noteOff(uint8_t midi) {
             // 踏板踩着：制音器没落下去，弦继续振动。只做标记，等踏板抬起再放。
             _sustained[i] = true;
         } else {
-            v.release(0.0f, _sampleRate);
+            v.release(0.0f, sampleRate);
         }
     }
 }
@@ -118,16 +126,19 @@ void VoicePool::applyPedalRelease() {
     // 踏板抬起：所有挂起的音真正进入释放。
     // 释放时长随踏板值变化 —— 半踩时制音器只是轻触琴弦，衰减比全放要慢。
     const float seconds = 0.03f + (static_cast<float>(_pedalValue) / 127.0f) * 0.37f;
+    const int32_t sampleRate = _sampleRate.load(std::memory_order_relaxed);
 
     for (int i = 0; i < kMaxVoices; ++i) {
         if (_sustained[i] && _voices[i].isActive() && !_voices[i].isReleasing()) {
-            _voices[i].release(seconds, _sampleRate);
+            _voices[i].release(seconds, sampleRate);
         }
         _sustained[i] = false;
     }
 }
 
 void VoicePool::allNotesOff(bool immediate) {
+    const int32_t sampleRate = _sampleRate.load(std::memory_order_relaxed);
+
     for (int i = 0; i < kMaxVoices; ++i) {
         if (!_voices[i].isActive()) {
             continue;
@@ -135,7 +146,7 @@ void VoicePool::allNotesOff(bool immediate) {
         if (immediate) {
             _voices[i].killImmediate();
         } else {
-            _voices[i].release(0.0f, _sampleRate);
+            _voices[i].release(0.0f, sampleRate);
         }
         _sustained[i] = false;
     }

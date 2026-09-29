@@ -2,6 +2,7 @@ import { _decorator, Component } from 'cc';
 import { KeyboardView } from './keyboard/KeyboardView';
 import { TouchRouter } from './keyboard/TouchRouter';
 import { PianoInputListener } from './keyboard/KeyboardInput';
+import { LOAD_DONE, LOAD_FAILED } from './audio/AudioBackend';
 import { EventBatcher } from './audio/EventBatcher';
 import { EngineAudioClock } from './audio/EngineAudioClock';
 import { PianoEngine } from './audio/PianoEngine';
@@ -45,8 +46,8 @@ export class PianoController extends Component implements PianoInputListener {
     private readonly _engine = PianoEngine.instance;
     private readonly _batcher = new EventBatcher(this._engine, new EngineAudioClock(this._engine));
 
-    /** 音源是否已载入。未载入时按键不会有声音 —— 读数据要能看出这一点 */
-    private _bankReady = false;
+    /** 音源载入是否已经报过结果。避免每帧重复打印同一条日志 */
+    private _loadReported = false;
     private _hud: DebugHud | null = null;
     private _lastNoteText = '—';
     private _lastVelocity = 0;
@@ -73,27 +74,48 @@ export class PianoController extends Component implements PianoInputListener {
         this._engine.create();
         this._engine.start();
 
-        // 音源载入是同步阻塞的（中端机几秒）。推迟到首帧渲染之后 ——
-        // 直接写在 onLoad 里会卡住场景首帧，Android 上还可能被判定为 ANR。
-        this.scheduleOnce(() => { this.loadBank(); }, 0.1);
+        // 载入是异步的（解码在后台线程），这里只是发起。推迟到首帧之后发起
+        // 是为了让场景先渲染出来 —— 启动瞬间那几毫秒不值得跟首帧抢。
+        this.scheduleOnce(() => { this.beginLoadBank(); }, 0.1);
     }
 
     /**
-     * 载入音源包。完成之前按键不会出声，这是预期行为 ——
-     * 调试读数上的「音源」一栏会显示当前状态。
+     * 发起载入音源包。**不再阻塞** —— 解码在原生侧的后台线程上进行，
+     * 进度每帧从读数上读（见 `snapshot`）。
      */
-    private loadBank(): void {
+    private beginLoadBank(): void {
         if (this._engine.kind === 'web') {
             // 编辑器预览：音源已内嵌在脚本包里（PreviewBankData.ts），
-            // 不走原生音源包。这里直接返回，免得在读数上误报「音源未载入」。
+            // 由 WebAudioEngine 自己后台解码，没有「发起载入」这一步。
             return;
         }
 
-        this._bankReady = this._engine.loadBank();
-        if (this._bankReady) {
+        if (!this._engine.beginLoadBank()) {
+            this._loadReported = true;
+            console.warn('[piano] 音源载入未能发起 —— 按键不会有声音。'
+                       + '检查音源包是否打进了 assets（见 build.gradle 的 PIANO_BANK_DIR）');
+        }
+    }
+
+    /**
+     * 载入结束时报一次结果。
+     *
+     * 之所以要单独报，是因为载入从「同步返回成功/失败」改成了异步：
+     * 失败不再有返回值可看，只能靠轮询进度发现问题。
+     */
+    private reportLoadResult(): void {
+        // 预览后端的进度是「内嵌音源解码到哪了」，与音源包无关 ——
+        // 用同一套文案报会指错方向（让人去查 build.gradle）
+        if (this._loadReported || this._engine.kind !== 'native') {
+            return;
+        }
+        const percent = this._engine.loadPercent;
+        if (percent === LOAD_DONE) {
+            this._loadReported = true;
             const mb = (this._engine.diagnostics().residentBytes / 1024 / 1024).toFixed(0);
             console.log(`[piano] 音源已载入，常驻 ${mb} MB`);
-        } else {
+        } else if (percent === LOAD_FAILED) {
+            this._loadReported = true;
             console.warn('[piano] 音源载入失败 —— 按键不会有声音。'
                        + '检查音源包是否打进了 assets（见 build.gradle 的 PIANO_BANK_DIR）');
         }
@@ -111,6 +133,7 @@ export class PianoController extends Component implements PianoInputListener {
         this._batcher.calibrate();
         this._batcher.flush();
 
+        this.reportLoadResult();
         this._hud?.update(this.snapshot());
     }
 
@@ -152,11 +175,16 @@ export class PianoController extends Component implements PianoInputListener {
         // 后端诊断是结构化数据，不是文案 —— 怎么排版是 DebugHud 的事
         const backend = this._engine.diagnostics();
 
+        // 读一次就够了：原生后端每读一次都要过一趟 JSB，而这一屏里
+        // 有两个字段要用它
+        const loadPercent = this._engine.loadPercent;
+
         return {
             engine: backend.status,
             backendKind: backend.kind,
             backend,
-            bankReady: this._bankReady,
+            bankReady: loadPercent === LOAD_DONE,
+            loadPercent,
             lastNote: this._lastNoteText,
             lastVelocity: this._lastVelocity,
             eventsSeen: this._router.eventsSeen,

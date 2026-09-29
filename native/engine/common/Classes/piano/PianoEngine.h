@@ -60,18 +60,34 @@ public:
     // ---------------------------------------------------------------- 音源
 
     /**
-     * 载入音源包。
+     * 载入音源包。**异步** —— 立即返回，解码在后台线程上进行。
+     *
+     * ## 为什么必须是异步
+     *
+     * 要读并解码约 250MB（全 16 层）。这个量级即使并行解码也要一两秒，
+     * 放在主线程上就是画面冻结，Android 上还可能被判 ANR。
+     * 现在主线程只负责「发起」，进度由 `loadProgress()` 查询。
      *
      * 数据源由平台实现（Android 走 assets + dr_flac，见 SampleSourceAndroid.cpp）。
-     * 会同步读完所有常驻采样 —— 这是个耗时操作，**不要在音频线程上调**，
-     * 也不要在启动动画期间调（约 250MB 的解码，中端机要几秒）。
+     * **每个解码线程各取一个数据源实例**，所以要求 `createPlatformSampleSource()`
+     * 每次调用都返回一个独立对象。
      *
      * @param residentLayerMask 要常驻的力度层掩码，位 0..15 对应层 1..16。
-     *        默认全 16 层（约 250MB）；低内存机型应传更小的掩码，
-     *        未常驻的层会由相邻层顶替（音色略有偏差但不漏音）。
-     * @return 是否成功
+     *        默认全 16 层（约 250MB）。**降档会降低音质**（未常驻的层由相邻层
+     *        顶替），本项目当前要求不降质，所以调用方一律传默认值。
+     * @return 是否已受理。已经在载、或线程起不来时返回 false
      */
     bool loadBank(uint16_t residentLayerMask = 0xFFFF);
+
+    /**
+     * 载入进度（百分比）。
+     *
+     * @return -2 失败 / -1 尚未开始 / 0..99 进行中 / 100 已完成
+     */
+    int32_t loadProgress() const;
+
+    /** 音源是否已就位（可以发声）。等价于 `loadProgress() == 100` */
+    bool bankReady() const;
 
     /** 常驻采样占用的字节数 */
     size_t residentBytes() const;
@@ -131,6 +147,12 @@ public:
     int32_t framesPerBurst() const;
 
 private:
+    /**
+     * 载入线程的主体。跑在后台线程上 —— 只写 `Impl` 里的原子进度、
+     * 以及**载入完成后一次性发布**的音源指针，不碰设备与事件队列。
+     */
+    void loadBankWorker(uint16_t residentLayerMask);
+
     struct Impl;
     std::unique_ptr<Impl> _impl;
 };

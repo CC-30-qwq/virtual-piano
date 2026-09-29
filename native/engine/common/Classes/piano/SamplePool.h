@@ -50,6 +50,14 @@ public:
     bool reserve(uint64_t totalFrames);
 
     /**
+     * 池的起始地址；池未分配时返回 nullptr。
+     *
+     * 并行载入用：多个解码线程各自往 `base() + 预分配偏移` 写，
+     * 互不相邻，因此不需要游标、也不需要互斥。
+     */
+    int16_t* base() noexcept { return _data.get(); }
+
+    /**
      * 当前写入位置。池未分配时返回 nullptr。
      *
      * ⚠️ 调用方必须先 `reserve` 足够容量。越界写入不会越出分配范围
@@ -64,6 +72,16 @@ public:
      *         这只可能发生在调用方算错容量的情况下。
      */
     bool commit(uint32_t frames) noexcept;
+
+    /**
+     * 直接把游标设到 `frames`（不累加）。
+     *
+     * 并行载入收尾用：各线程写完后由单线程压实空洞、算出真实占用，
+     * 再一次性把结果写回。用 `commit` 会因为游标语义（累加）而算重。
+     *
+     * @return 是否成功。超过容量时返回 false 且不改变游标。
+     */
+    bool setCommitted(size_t frames) noexcept;
 
     /** 已确认占用的字节数（= 常驻采样占用，供 UI 显示） */
     size_t bytes() const noexcept { return _cursorFrames * 4; }

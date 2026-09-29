@@ -15,8 +15,10 @@
 
 #include "SampleBank.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -134,6 +136,66 @@ public:
     bool readFile(const char*, std::vector<uint8_t>&) override { return false; }
     uint32_t _frames = 0;
 };
+
+/**
+ * 内容由路径决定的确定性数据源。
+ *
+ * 并行载入的正确性判据是「与串行**逐字节相同**」，所以每条文件的内容必须
+ * 因路径而异 —— 都用同一份常量的话，线程之间就算串了数据也看不出来。
+ *
+ * 帧数取 40..69，都短于 manifest 声明的 100+：这样既走「实际比声明短」的
+ * 分支（收尾要压实），又不会超过预分配的空间。
+ */
+class PatternSource : public SampleSource {
+public:
+    /** 设成 true 时对路径含 "v2" 的文件报失败，用于测部分失败下的压实 */
+    bool failLayer2 = false;
+
+    bool open(const char* relativePath) override {
+        _path = relativePath ? relativePath : "";
+        if (failLayer2 && _path.find("v2") != std::string::npos) {
+            return false;
+        }
+        _frames = 40 + (hash(_path) % 30);
+        return true;
+    }
+    uint32_t frames() const override { return _frames; }
+    uint32_t readAll(int16_t* out) override {
+        const uint32_t seed = hash(_path);
+        for (uint32_t i = 0; i < _frames * 2; ++i) {
+            // 每个文件、每个采样点都不一样，但完全确定
+            out[i] = static_cast<int16_t>((seed + i * 2654435761u) >> 13);
+        }
+        return _frames;
+    }
+    void close() override {}
+    bool readFile(const char*, std::vector<uint8_t>&) override { return false; }
+
+    static uint32_t hash(const std::string& s) {
+        uint32_t h = 2166136261u;   // FNV-1a
+        for (unsigned char c : s) {
+            h ^= c;
+            h *= 16777619u;
+        }
+        return h;
+    }
+
+private:
+    std::string _path;
+    uint32_t _frames = 0;
+};
+
+/** 每次返回一个**新的**实例 —— 并行载入要求每线程独占一个 */
+std::unique_ptr<SampleSource> makePatternSource() {
+    return std::unique_ptr<SampleSource>(new PatternSource());
+}
+
+/** 同上，但所有实例都对 v2 层报失败 */
+std::unique_ptr<SampleSource> makeFailingPatternSource() {
+    PatternSource* s = new PatternSource();
+    s->failLayer2 = true;
+    return std::unique_ptr<SampleSource>(s);
+}
 
 // ------------------------------------------------------------------ 测试
 
@@ -291,6 +353,149 @@ void testLoadFailure() {
     check(bank.findLayer(bank.rootNotes()[0], 64) == nullptr, "无可用层时返回空");
 }
 
+/** 逐层比对两个银行的常驻 PCM，返回比对的层数 */
+size_t compareResident(const SampleBank& a, const SampleBank& b, bool& same) {
+    size_t compared = 0;
+    same = true;
+
+    if (a.rootNotes().size() != b.rootNotes().size()) {
+        same = false;
+        return 0;
+    }
+    for (size_t r = 0; r < a.rootNotes().size(); ++r) {
+        const RootNote& ra = a.rootNotes()[r];
+        const RootNote& rb = b.rootNotes()[r];
+        if (ra.layerCount != rb.layerCount) {
+            same = false;
+            break;
+        }
+        for (uint8_t i = 0; i < ra.layerCount; ++i) {
+            const SampleLayer& la = ra.layers[i];
+            const SampleLayer& lb = rb.layers[i];
+
+            if (la.resident() != lb.resident()) {
+                same = false;
+                continue;
+            }
+            if (!la.resident()) {
+                continue;   // 两边都没载入，一致
+            }
+            if (la.attackFrames != lb.attackFrames) {
+                same = false;
+                continue;
+            }
+            const size_t bytes = static_cast<size_t>(la.attackFrames) * 2u * sizeof(int16_t);
+            if (std::memcmp(la.attack, lb.attack, bytes) != 0) {
+                same = false;
+            }
+            ++compared;
+        }
+    }
+    return compared;
+}
+
+/**
+ * 并行载入的核心验收：**产出的 PCM 与串行逐字节相同**。
+ *
+ * 这是「不降低音质」这条硬约束的可执行形式 —— 并行只允许改变「谁先跑完」，
+ * 不允许改变任何一个采样点。
+ */
+void testParallelMatchesSequential() {
+    std::printf("\n== 并行载入 ==\n");
+
+    const std::vector<uint8_t> data = makeManifest();
+
+    SampleBank serial;
+    SampleBank parallel;
+    serial.loadManifest(data.data(), data.size());
+    parallel.loadManifest(data.data(), data.size());
+
+    PatternSource single;
+    check(serial.loadResident(single), "串行载入成功");
+    check(parallel.loadResident(&makePatternSource, 4), "并行载入成功");
+
+    check(serial.residentBytes() == parallel.residentBytes(),
+          "常驻字节数一致");
+    check(parallel.residentBytes() > 0, "并行载入确实占用了内存");
+
+    bool same = false;
+    const size_t compared = compareResident(serial, parallel, same);
+    check(compared == 6, "逐层比对了 6 层（2 根音 × 3 层）");
+    check(same, "并行与串行的 PCM 逐字节相同");
+
+    // 单线程走的是「不起线程」的分支，也该得到同样的结果
+    SampleBank singleThread;
+    singleThread.loadManifest(data.data(), data.size());
+    check(singleThread.loadResident(&makePatternSource, 1), "1 线程载入成功");
+    bool sameOne = false;
+    compareResident(serial, singleThread, sameOne);
+    check(sameOne, "1 线程与串行的 PCM 逐字节相同");
+}
+
+/**
+ * 部分失败时的收尾：失败项留出的空洞要被后面的采样填上，
+ * 且结果必须与串行遇到同样的失败时完全一致。
+ *
+ * 这条路径只有在「读坏了」的时候才走到，平时看不到 —— 但不测就等于没有。
+ */
+void testParallelCompactionOnFailure() {
+    std::printf("\n== 部分失败下的压实 ==\n");
+
+    const std::vector<uint8_t> data = makeManifest();
+
+    SampleBank serial;
+    SampleBank parallel;
+    serial.loadManifest(data.data(), data.size());
+    parallel.loadManifest(data.data(), data.size());
+
+    PatternSource failing;
+    failing.failLayer2 = true;
+    check(!serial.loadResident(failing), "串行：有失败项时返回 false");
+    check(!parallel.loadResident(&makeFailingPatternSource, 4), "并行：有失败项时返回 false");
+
+    const RootNote& root = parallel.rootNotes()[0];
+    check(!root.layers[1].resident(), "失败的第 2 层未标记为常驻");
+    check(root.layers[0].resident() && root.layers[2].resident(), "成功的层照常常驻");
+
+    // 4 层成功（2 根音 × 2 层），每层 40..69 帧 —— 常驻量必须只算成功的那些
+    size_t expected = 0;
+    for (const RootNote& r : parallel.rootNotes()) {
+        for (uint8_t i = 0; i < r.layerCount; ++i) {
+            if (r.layers[i].resident()) {
+                expected += static_cast<size_t>(r.layers[i].attackFrames) * 4u;
+            }
+        }
+    }
+    check(parallel.residentBytes() == expected, "常驻字节数只计成功的层（空洞已压实）");
+    check(parallel.residentBytes() == serial.residentBytes(), "并行与串行的常驻量一致");
+
+    bool same = false;
+    const size_t compared = compareResident(serial, parallel, same);
+    check(compared == 4, "逐层比对了 4 层");
+    check(same, "失败路径下并行与串行仍逐字节相同");
+}
+
+/** 进度回调要覆盖 1..total 各一次 —— 少一次就是有 job 被漏掉了 */
+void testProgressCallback() {
+    std::printf("\n== 载入进度 ==\n");
+
+    const std::vector<uint8_t> data = makeManifest();
+
+    SampleBank bank;
+    bank.loadManifest(data.data(), data.size());
+
+    std::atomic<unsigned> seen{0};      // 第 d 次回调置位第 d-1 位
+    std::atomic<size_t> total{0};
+    bank.setProgressCallback([&seen, &total](size_t done, size_t all) {
+        seen.fetch_or(1u << (done - 1), std::memory_order_relaxed);
+        total.store(all, std::memory_order_relaxed);
+    });
+
+    check(bank.loadResident(&makePatternSource, 4), "带进度回调载入成功");
+    check(total.load() == 6, "总条数上报为 6");
+    check(seen.load() == 0x3Fu, "进度回调覆盖 1..6 各一次");
+}
+
 /** 真实的 manifest.bin 集成检查 */
 void testRealManifest(const char* path) {
     std::printf("\n== 真实 manifest 集成检查 ==\n");
@@ -368,6 +573,9 @@ int main(int argc, char** argv) {
     testFindRoot();
     testResidentAndFallback();
     testLoadFailure();
+    testParallelMatchesSequential();
+    testParallelCompactionOnFailure();
+    testProgressCallback();
     testRealManifest(argc > 1 ? argv[1] : "build-bank/manifest.bin");
 
     std::printf("\n%s（失败 %d 项）\n", g_failures == 0 ? "全部通过" : "存在失败", g_failures);

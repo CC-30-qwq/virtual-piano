@@ -14,6 +14,16 @@
  */
 
 /**
+ * 音源载入进度的取值。
+ *
+ * 与 C++ 侧 `PianoEngine::loadProgress()` 逐值对应 —— **两边改要一起改**。
+ * 做成常量而不是散落的字面量：`-1` 和 `-2` 靠读代码分不清哪个是失败。
+ */
+export const LOAD_FAILED = -2;
+export const LOAD_IDLE = -1;
+export const LOAD_DONE = 100;
+
+/**
  * 结构化的诊断数据。
  *
  * 刻意是数据而不是**文案**：文案属于 UI（`DebugHud`），引擎层只管把数报准。
@@ -64,12 +74,23 @@ export interface AudioBackend {
     // ---------------------------------------------------------------- 音源与事件
 
     /**
-     * 载入音源包。**同步阻塞**，要读完并解码几百 MB（中端机几秒）——
-     * 不要放在场景加载路径里，用 `scheduleOnce` 推迟到首帧之后。
+     * 发起音源载入。**立即返回** —— 解码在后台进行，不阻塞主线程。
      *
-     * @param layerMask 常驻力度层掩码，位 0..15 对应层 1..16；-1 表示全 16 层
+     * 早先这个方法是同步阻塞的（读完并解码几百 MB，中端机几秒），
+     * 于是主线程在那几秒里完全冻结。现在主线程只负责发起。
+     *
+     * @param layerMask 常驻力度层掩码，位 0..15 对应层 1..16；-1 表示全 16 层。
+     *        ⚠️ 传更小的值会降质（未常驻的层由相邻层顶替），当前不接受。
+     * @returns 是否已受理。**不代表已经能发声** —— 那要查 `loadPercent`
      */
-    loadBank(layerMask: number): boolean;
+    beginLoadBank(layerMask: number): boolean;
+
+    /**
+     * 载入进度：`LOAD_FAILED` / `LOAD_IDLE` / 0..99 / `LOAD_DONE`。
+     *
+     * 每帧查询是有意的开销（原生侧要过一次 JSB），所以实现应当缓存终态。
+     */
+    readonly loadPercent: number;
 
     /**
      * 批量提交演奏事件。返回实际受理条数。

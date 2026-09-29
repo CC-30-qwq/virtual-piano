@@ -80,6 +80,21 @@ android {
         }
     }
 
+    // 音源包里的 FLAC 不参与 APK 压缩。
+    //
+    // AGP 默认的免压缩后缀表只覆盖 wav/mp3/ogg/aac 等，**不含 flac** ——
+    // 不写这一条，208MB 已经压过一次的 FLAC 会在打包时再被 deflate 一遍：
+    //   - 打包本身就慢，且收益接近 0（甚至因 deflate 头而略增体积）；
+    //   - 运行时更贵：压缩资产没有真正的随机访问，AssetManager 内部要维护
+    //     inflate 流，向后 seek 要重新开始；而 dr_flac 打开时会先 seek 到
+    //     文件尾取总长，等于每个文件被解压两遍（见《音源冷启动载入耗时定位
+    //     与优化方案》§2 的 S2）。
+    //
+    // ⚠️ AGP 8 已移除 aaptOptions，只能写 androidResources。
+    androidResources {
+        noCompress += 'flac'
+    }
+
     externalNativeBuild {
         cmake {
             version "3.22.1"

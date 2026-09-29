@@ -1,4 +1,10 @@
-import { AudioBackend, BackendDiagnostics } from './AudioBackend';
+import {
+    AudioBackend,
+    BackendDiagnostics,
+    LOAD_DONE,
+    LOAD_FAILED,
+    LOAD_IDLE,
+} from './AudioBackend';
 
 /**
  * 原生后端 —— 包住 JSB 注入的全局对象 `jsbPiano`。
@@ -18,12 +24,18 @@ export interface IJsbPiano {
 
     // 音源包
     /**
-     * 载入音源包。**同步阻塞**，要读完并解码几百 MB（中端机几秒）。
+     * 发起载入音源包。**异步**：立即返回，解码在后台线程上进行。
      *
      * @param layerMask 常驻力度层掩码，位 0..15 对应层 1..16。传 -1 表示全 16 层。
-     * @returns 1 成功 / 0 失败
+     * @returns 1 已受理 / 0 未受理（已在载、或线程起不来）
      */
     loadBank(layerMask: number): number;
+
+    /**
+     * 载入进度：-2 失败 / -1 未开始 / 0..99 进行中 / 100 已完成。
+     * 与 `AudioBackend` 里的 `LOAD_*` 常量逐值对应。
+     */
+    getLoadProgress(): number;
     getResidentBytes(): number;
 
     /**
@@ -75,6 +87,9 @@ export class NativeBackend implements AudioBackend {
     private _created = false;
     private _running = false;
 
+    /** 上一次问到的载入进度。完成/失败之后不再重复过 JSB */
+    private _lastLoadPercent = LOAD_IDLE;
+
     constructor(private readonly _jsb: IJsbPiano | undefined) {}
 
     get available(): boolean {
@@ -110,8 +125,39 @@ export class NativeBackend implements AudioBackend {
     /** 原生平台没有自动播放限制，空操作 */
     resume(): void {}
 
-    loadBank(layerMask: number): boolean {
-        return this._jsb ? this._jsb.loadBank(layerMask) !== 0 : false;
+    /**
+     * 发起载入。
+     *
+     * ⚠️ 返回值是「**已受理**」而不是「已载完」—— C++ 侧改异步之后语义就变了。
+     * 沿用旧语义（当成成功）会让控制器立刻显示「音源已载入 xxx MB」，
+     * 而实际上一个采样都还没解出来。
+     */
+    beginLoadBank(layerMask: number): boolean {
+        if (!this._jsb) {
+            return false;
+        }
+        const accepted = this._jsb.loadBank(layerMask) !== 0;
+        if (accepted) {
+            this._lastLoadPercent = 0;
+        }
+        return accepted;
+    }
+
+    /**
+     * 载入进度。
+     *
+     * 终态（完成/失败）一旦拿到就**记下来不再问** —— 这个属性会被控制器每帧读，
+     * 每次过一趟 JSB 没有意义，而载入完成后它永远不变。
+     */
+    get loadPercent(): number {
+        if (!this._jsb) {
+            return LOAD_IDLE;
+        }
+        if (this._lastLoadPercent === LOAD_DONE || this._lastLoadPercent === LOAD_FAILED) {
+            return this._lastLoadPercent;
+        }
+        this._lastLoadPercent = this._jsb.getLoadProgress();
+        return this._lastLoadPercent;
     }
 
     submit(buffer: ArrayBuffer, count: number): number {

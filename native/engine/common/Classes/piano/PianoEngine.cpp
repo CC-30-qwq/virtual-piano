@@ -5,8 +5,11 @@
 #include "PianoEngine.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <thread>
+#include <vector>
 
 #include "AudioDevice.h"
 #include "Diagnostics.h"
@@ -71,7 +74,20 @@ struct PianoEngine::Impl {
      */
     PianoEvent staging[kEventQueueCapacity];
 
-    /** 音源库。只在主线程载入，载入完成后音频线程只读。 */
+    /**
+     * 载入进度，百分比。见 `PianoEngine::loadProgress()` 的取值约定。
+     *
+     * 由载入线程写、主线程读（TS 每帧轮询），所以是原子量。
+     */
+    std::atomic<int32_t> loadPercent{-1};
+
+    /** 载入线程。`destroy()` 与析构都要 join 它 —— 银行不能在被读时析构 */
+    std::thread loadThread;
+
+    /**
+     * 音源库。由载入线程填充，填完后经 `pool.setBank()` **一次性发布** 给音频线程。
+     * 发布之前音频线程不会读它（`VoicePool::noteOn` 开头就判空）。
+     */
     SampleBank bank;
 
     /** 复音管理。音频线程独占调用，主线程只读计数。 */
@@ -210,7 +226,15 @@ bool PianoEngine::create(int32_t sampleRate, int32_t framesPerCallback) {
 }
 
 void PianoEngine::destroy() {
+    // ⚠️ 先等载入线程收工，**而且要在 `created` 判断之前**。
+    // 它此刻可能正往银行、内存池里写；漏掉这次 join，它会在这个对象
+    // 析构之后继续往已释放的内存里写 —— 纯崩溃，且现场和载入毫无关系。
+    if (_impl->loadThread.joinable()) {
+        _impl->loadThread.join();
+    }
+
     if (!_impl->created) return;
+
     stop();
     // M1 在这里释放采样常驻内存。
     _impl->created = false;
@@ -326,44 +350,119 @@ int32_t PianoEngine::framesPerBurst() const {
 // ---------------------------------------------------------------- 音源
 
 bool PianoEngine::loadBank(uint16_t residentLayerMask) {
-    auto source = createPlatformSampleSource();
-    if (!source) {
-        PIANO_LOG_INFO("[piano] 当前平台没有采样数据源，音源不可用");
+    if (_impl->loadThread.joinable()) {
+        // 线程一旦起来就一直 joinable（要等 destroy 才 join），所以这一条同时
+        // 覆盖「正在载」与「已经载过」—— 两种情况都该拒绝：
+        // 前者是两个线程往同一个银行里写，后者是白解一遍 252MB。
+        PIANO_LOG_INFO("[piano] 音源已载入或正在载入，忽略重复请求");
         return false;
     }
 
-    std::vector<uint8_t> manifest;
-    if (!source->readFile("manifest.bin", manifest)) {
-        PIANO_LOG_INFO("[piano] 读不到 manifest.bin（音源包没打进 assets？）");
+    _impl->loadPercent.store(0, std::memory_order_relaxed);
+    try {
+        _impl->loadThread = std::thread([this, residentLayerMask] {
+            loadBankWorker(residentLayerMask);
+        });
+    } catch (...) {
+        // 线程起不来（极端内存压力）。进度回退成「未开始」，
+        // 让调用方看到的是「没载」而不是「卡在 0%」。
+        _impl->loadPercent.store(-1, std::memory_order_relaxed);
+        PIANO_LOG_INFO("[piano] 载入线程创建失败");
         return false;
+    }
+    return true;
+}
+
+/**
+ * 载入线程的主体。
+ *
+ * ## 这里为什么能跑在后台线程上
+ *
+ * 它只做三件事：读 manifest、解码填池、把填好的银行**一次性发布**给音频线程。
+ * 不碰音频设备、不碰事件队列、不碰参数 —— 那些仍然只有主线程能碰。
+ *
+ * ## 进度是「条数」而不是字节
+ *
+ * 每条采样的字节数差好几倍（低音区 4.0s、高音区 1.2s），但**解码时间**
+ * 主要由条数决定（每条都要开文件、解头、分配），按条数报反而更贴近实际耗时。
+ */
+void PianoEngine::loadBankWorker(uint16_t residentLayerMask) {
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    auto msSince = [](Clock::time_point from) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - from).count();
+    };
+
+    auto fail = [this]() {
+        _impl->loadPercent.store(-2, std::memory_order_relaxed);
+    };
+
+    // manifest 要单独读 —— 它不经过解码，且必须在载入任何采样之前读到
+    std::vector<uint8_t> manifest;
+    {
+        std::unique_ptr<SampleSource> source = createPlatformSampleSource();
+        if (!source) {
+            PIANO_LOG_INFO("[piano] 当前平台没有采样数据源，音源不可用");
+            fail();
+            return;
+        }
+        if (!source->readFile("manifest.bin", manifest)) {
+            PIANO_LOG_INFO("[piano] 读不到 manifest.bin（音源包没打进 assets？）");
+            fail();
+            return;
+        }
     }
 
     if (!_impl->bank.loadManifest(manifest.data(), manifest.size())) {
         PIANO_LOG_INFO("[piano] manifest 解析失败");
-        return false;
+        fail();
+        return;
     }
-
     _impl->bank.setLayerMask(residentLayerMask);
 
-    // 这一步是同步的，要读完几百 MB 并解码 —— 中端机需要几秒。
-    // 调用方应当放在启动流程里、并且不要挡住首帧渲染。
-    PIANO_LOG_INFO("[piano] 开始载入常驻采样，预计 %.0f MB",
-                   _impl->bank.estimateResidentBytes() / 1024.0 / 1024.0);
+    const double manifestMs = msSince(t0);
+    PIANO_LOG_INFO("[piano] manifest 就绪，%.1f ms；开始载入常驻采样，预计 %.0f MB",
+                   manifestMs, _impl->bank.estimateResidentBytes() / 1024.0 / 1024.0);
 
-    if (!_impl->bank.loadResident(*source)) {
+    // 进度：manifest 之后从 1% 起，解码占 1..99，发布完成才是 100。
+    // 留出这段余量是因为收尾（压实 + 发布）虽然快，但不能报成「已完成」
+    // 而实际还不能发声。
+    _impl->bank.setProgressCallback([this](size_t done, size_t total) {
+        const int32_t pct = total == 0
+                                ? 99
+                                : 1 + static_cast<int32_t>(done * 98 / total);
+        _impl->loadPercent.store(pct, std::memory_order_relaxed);
+    });
+
+    const auto tDecode = Clock::now();
+    const bool allOk = _impl->bank.loadResident(&createPlatformSampleSource, 0);
+    const double decodeMs = msSince(tDecode);
+
+    if (!allOk) {
         // 部分失败不当作整体失败：载入成功的层照常可用，
         // 演奏时缺失的力度层会由相邻层顶替（见 SampleBank::findLayer）。
         PIANO_LOG_INFO("[piano] 部分采样载入失败，将由其相邻层顶替");
     }
 
-    _impl->pool.setBank(&_impl->bank);
-    // 用实际生效的采样率，而不是请求值 —— 否则会把 start() 里设好的真实值覆盖掉
+    // 发布顺序不能反：采样率要先设好，再 release 银行指针 ——
+    // 音频线程 acquire 到银行时，采样率已经可见（见 VoicePool::setBank）。
     _impl->pool.setSampleRate(_impl->effectiveSampleRate());
+    _impl->pool.setBank(&_impl->bank);
+    _impl->loadPercent.store(100, std::memory_order_relaxed);
 
-    PIANO_LOG_INFO("[piano] 音源载入完成，常驻 %.0f MB，根音 %u 个",
+    PIANO_LOG_INFO("[piano] 音源载入完成：%u 根音，常驻 %.0f MB；"
+                   "manifest %.1f ms + 解码 %.1f ms = 合计 %.1f ms",
+                   static_cast<unsigned>(_impl->bank.rootNotes().size()),
                    _impl->bank.residentBytes() / 1024.0 / 1024.0,
-                   static_cast<unsigned>(_impl->bank.rootNotes().size()));
-    return true;
+                   manifestMs, decodeMs, msSince(t0));
+}
+
+int32_t PianoEngine::loadProgress() const {
+    return _impl->loadPercent.load(std::memory_order_relaxed);
+}
+
+bool PianoEngine::bankReady() const {
+    return _impl->loadPercent.load(std::memory_order_relaxed) == 100;
 }
 
 size_t PianoEngine::residentBytes() const {

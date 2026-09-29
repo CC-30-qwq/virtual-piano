@@ -1,6 +1,6 @@
 import { sys } from 'cc';
 
-import { AudioBackend, BackendDiagnostics } from './AudioBackend';
+import { AudioBackend, BackendDiagnostics, LOAD_DONE } from './AudioBackend';
 import { getNativeJsBridge, NativeBackend } from './NativeBackend';
 import { WebBackend } from './WebBackend';
 
@@ -109,16 +109,32 @@ export class PianoEngine {
     }
 
     /**
-     * 载入音源包。
+     * 发起载入音源包。**异步** —— 立即返回，解码在后台进行。
      *
-     * ⚠️ **同步阻塞**。要读完并解码几百 MB，中端机需要几秒 ——
-     * 不要在场景加载路径里直接调用，否则会卡住首帧（Android 上还可能被判 ANR）。
-     * 用 `scheduleOnce` 之类的机制推迟到首帧渲染之后。
+     * 早先它是同步阻塞的（读完并解码 252MB，中端机几秒），主线程在那几秒里
+     * 完全冻结，Android 上还可能被判 ANR。现在这里只发起，进度看 `loadPercent`。
      *
-     * @param layerMask 常驻力度层掩码，位 0..15 对应层 1..16；-1 表示全 16 层
+     * @param layerMask 常驻力度层掩码，位 0..15 对应层 1..16；-1 表示全 16 层。
+     *        ⚠️ 传更小的掩码会**降低音质**（未常驻的层由相邻层顶替）—— 当前不接受。
+     * @returns 是否已受理。**不代表已经能发声**
      */
-    loadBank(layerMask = -1): boolean {
-        return this._backend.loadBank(layerMask);
+    beginLoadBank(layerMask = -1): boolean {
+        return this._backend.beginLoadBank(layerMask);
+    }
+
+    /**
+     * 音源载入进度：-2 失败 / -1 未开始 / 0..99 进行中 / 100 已完成。
+     *
+     * 语义由常量 `LOAD_FAILED` / `LOAD_IDLE` / `LOAD_DONE` 表达，不要在调用点
+     * 写裸数字 —— `-1` 与 `-2` 光看代码分不清哪个是失败。
+     */
+    get loadPercent(): number {
+        return this._backend.loadPercent;
+    }
+
+    /** 音源是否已就位（此时按键才会发声） */
+    get bankReady(): boolean {
+        return this._backend.loadPercent === LOAD_DONE;
     }
 
     // ---------------------------------------------------------------- 参数

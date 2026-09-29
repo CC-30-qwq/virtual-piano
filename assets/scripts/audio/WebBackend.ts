@@ -1,4 +1,4 @@
-import { AudioBackend, BackendDiagnostics } from './AudioBackend';
+import { AudioBackend, BackendDiagnostics, LOAD_DONE, LOAD_FAILED } from './AudioBackend';
 import { decodeEventAt, DecodedEvent } from './EventCodec';
 import { EventType } from './PianoTypes';
 import { WebAudioEngine } from './WebAudioEngine';
@@ -49,9 +49,26 @@ export class WebBackend implements AudioBackend {
         this._web.resume();
     }
 
-    loadBank(_layerMask: number): boolean {
-        // 预览音源是内嵌的极小子集，随脚本一起载入，没有「载入音源包」这一步
+    beginLoadBank(_layerMask: number): boolean {
+        // 预览音源是内嵌的极小子集，随脚本一起载入，没有「载入音源包」这一步。
+        // 它的解码是 WebAudioEngine 自己在后台做的，进度从那儿取（见 loadPercent）。
         return false;
+    }
+
+    /**
+     * 载入进度。
+     *
+     * 这里**不是**「没载入」而是「正在解码内嵌音源」—— 两者在 UI 上要分开显示，
+     * 否则编辑器里会一直挂着「音源未载入」的警告，看起来像坏了。
+     */
+    get loadPercent(): number {
+        if (!this._web.available || this._web.decodeFailed) {
+            return LOAD_FAILED;
+        }
+        if (this._web.ready) {
+            return LOAD_DONE;
+        }
+        return Math.floor(this._web.progress * 100);
     }
 
     submit(buffer: ArrayBuffer, count: number): number {

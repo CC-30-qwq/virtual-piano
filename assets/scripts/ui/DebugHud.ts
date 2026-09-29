@@ -1,5 +1,5 @@
 import { Canvas, Color, Label, Node, UITransform, Vec3 } from 'cc';
-import { BackendDiagnostics } from '../audio/AudioBackend';
+import { BackendDiagnostics, LOAD_DONE, LOAD_FAILED } from '../audio/AudioBackend';
 
 /**
  * 左上角调试读数。
@@ -94,6 +94,13 @@ export interface HudSnapshot {
     backend: BackendDiagnostics;
     /** 音源是否已载入（原生才有意义） */
     bankReady: boolean;
+    /**
+     * 载入进度：-2 失败 / -1 未开始 / 0..99 进行中 / 100 已完成。
+     *
+     * 载入改成异步之后，「还没开始」和「正在载」必须分得开 —— 否则启动那几秒
+     * 读数上显示的会是「未载入（按键无声）」，看起来像坏了。
+     */
+    loadPercent: number;
 
     /** 最近触发的音名，如「C4」；没弹过是「—」 */
     lastNote: string;
@@ -137,10 +144,11 @@ function format(s: HudSnapshot): string {
         );
         // 音源没载入时按键必然无声。把状态显示出来，免得把「没载入」
         // 误判成「触摸没响应」。
-        const mb = b.residentBytes / 1024 / 1024;
-        lines.push(s.bankReady
-            ? `音源  已载入 ${mb.toFixed(0)} MB`
-            : '音源  ⚠ 未载入（按键无声）');
+        //
+        // 三种状态要分开：载入是后台进行的，启动后有几秒钟处在「进行中」，
+        // 那时候按键无声是预期行为，不该报警告。
+        const mb = (b.residentBytes / 1024 / 1024).toFixed(0);
+        lines.push(describeLoad(s.loadPercent, s.bankReady, mb));
     } else {
         lines.push(`预览  ${s.backend.voices} 个发声`);
     }
@@ -157,6 +165,25 @@ function format(s: HudSnapshot): string {
     }
 
     return lines.join('\n');
+}
+
+/**
+ * 音源那一行怎么写。
+ *
+ * 单独抽出来是因为它有四个分支，塞进 `format` 里会把别的行挤得看不清 ——
+ * 而且这四种状态的区分本身就是「别把预期行为当成故障」的关键。
+ */
+function describeLoad(percent: number, bankReady: boolean, mb: string): string {
+    if (bankReady || percent === LOAD_DONE) {
+        return `音源  已载入 ${mb} MB`;
+    }
+    if (percent === LOAD_FAILED) {
+        return '音源  ⚠ 载入失败（按键无声）';
+    }
+    if (percent < 0) {
+        return '音源  ⚠ 未载入（按键无声）';
+    }
+    return `音源  载入中 ${percent}%`;
 }
 
 /** 沿父链向上找挂 Canvas 组件的节点 */

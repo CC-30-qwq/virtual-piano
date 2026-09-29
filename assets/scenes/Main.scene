@@ -85,6 +85,9 @@
       },
       {
         "__id__": 22
+      },
+      {
+        "__id__": 32
       }
     ],
     "_prefab": null,
@@ -556,7 +559,7 @@
     "_left": 0,
     "_right": 0,
     "_top": 0,
-    "_bottom": 160,
+    "_bottom": 0,
     "_horizontalCenter": 0,
     "_verticalCenter": 0,
     "_isAbsLeft": true,
@@ -903,5 +906,35 @@
   {
     "__type__": "cc.PostSettingsInfo",
     "_toneMappingType": 0
+  },
+  {
+    "__type__": "cc.Widget",
+    "_name": "",
+    "_objFlags": 0,
+    "__editorExtras__": {},
+    "node": {
+      "__id__": 2
+    },
+    "_enabled": true,
+    "__prefab": null,
+    "_alignFlags": 45,
+    "_target": null,
+    "_left": 0,
+    "_right": 0,
+    "_top": 0,
+    "_bottom": 0,
+    "_horizontalCenter": 0,
+    "_verticalCenter": 0,
+    "_isAbsLeft": true,
+    "_isAbsRight": true,
+    "_isAbsTop": true,
+    "_isAbsBottom": true,
+    "_isAbsHorizontalCenter": true,
+    "_isAbsVerticalCenter": true,
+    "_originalWidth": 1280,
+    "_originalHeight": 720,
+    "_alignMode": 1,
+    "_lockFlags": 0,
+    "_id": "w23CanvasWidget0000A"
   }
 ]

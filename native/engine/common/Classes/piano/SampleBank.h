@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +41,19 @@
 #include "SampleSource.h"
 
 namespace piano {
+
+/**
+ * 采样数据源工厂。**每个解码线程各取一个实例** ——
+ * `SampleSource` 是有状态的（持有当前打开的文件、解码器、缓冲），
+ * 一个实例被两个线程同时 open/read 会直接串数据。
+ *
+ * 用裸函数指针而不是 `std::function`：实现就是 `createPlatformSampleSource`，
+ * 不需要捕获任何东西，也省掉一次间接调用。
+ */
+using SampleSourceFactory = std::unique_ptr<SampleSource> (*)();
+
+/** 载入进度回调。`done`/`total` 都是「条数」（一层采样文件 = 一条） */
+using LoadProgressFn = std::function<void(size_t done, size_t total)>;
 
 class SampleBank {
 public:
@@ -95,6 +109,24 @@ public:
      */
     bool loadResident(SampleSource& source);
 
+    /**
+     * 并行载入：每线程一个数据源实例，同时解码。
+     *
+     * **产出的 PCM 与串行版本逐字节相同** —— 同一个解码器、同一条文件、
+     * 同一段目标偏移，只是并发执行。这是「不降低音质」前提下的主要提速手段。
+     *
+     * @param factory 每次调用返回一个**新的**数据源实例
+     * @param workers 解码线程数。0 = 按硬件并发自动取（夹在 1..4）
+     * @return 是否全部成功。任何一条失败都会返回 false（成功的照常保留）
+     */
+    bool loadResident(const SampleSourceFactory& factory, int workers = 0);
+
+    /**
+     * 载入进度回调。会在**工作线程**上被调用，实现方自己保证线程安全
+     * （通常只是往一个 `std::atomic<int>` 里写）。
+     */
+    void setProgressCallback(LoadProgressFn fn) { _onProgress = std::move(fn); }
+
     /** 实际常驻内存字节数 */
     size_t residentBytes() const { return _pool.bytes(); }
 
@@ -124,14 +156,52 @@ public:
      */
     uint8_t layerIndexForVelocity(uint8_t velocity) const;
 
+    /** 并行载入的默认线程数：硬件并发，夹在 [1, 4] */
+    static int defaultWorkerCount();
+
 private:
     void clear();
 
     /** 该层是否被当前掩码选中 */
     bool isSelected(const SampleLayer& layer) const;
 
-    /** 读入一层。成功时把池内地址写回 `layer.attack` 并确认占用 */
-    bool loadLayer(SampleSource& source, SampleLayer& layer);
+    /**
+     * 一条待载入的采样。把「读哪条、写到池里哪个位置」先算好，
+     * 解码线程之间才不会互相踩 —— 每个 job 的目标区段互不相邻。
+     */
+    struct LoadJob {
+        SampleLayer* layer = nullptr;
+        /** 池内预分配的起始帧下标 */
+        size_t offsetFrames = 0;
+        /** 实际读到的帧数（成功时有效） */
+        uint32_t framesRead = 0;
+        bool ok = false;
+    };
+
+    /**
+     * 按掩码排出全部待载入项，并预分配各自在池内的偏移。
+     *
+     * 非 const：返回的 job 持有可写的 `SampleLayer*`，收尾时要往层里写回指针。
+     */
+    std::vector<LoadJob> planJobs();
+
+    /**
+     * 解码一条并写入它在池内的预定位置。
+     *
+     * 不做任何跨 job 的簿记（不碰游标、不写 `layer.attack`）—— 那些都在
+     * `finalizeJobs` 里单线程收尾，于是本函数可以被多个线程同时调用。
+     */
+    bool readJob(SampleSource& source, LoadJob& job);
+
+    /**
+     * 收尾：把成功的项按顺序压实（失败项留出的空洞由后面的采样补上），
+     * 写回 `layer.attack`，并一次性确认池的占用。
+     *
+     * 全部成功时**不发生任何搬运** —— 此时预分配偏移正好等于压实后的位置。
+     *
+     * @return 是否全部成功
+     */
+    bool finalizeJobs(std::vector<LoadJob>& jobs);
 
     bool _loaded = false;
 
@@ -139,6 +209,9 @@ private:
     ManifestData _manifest;
 
     uint16_t _layerMask = 0xFFFF;
+
+    /** 载入进度回调。只在工作线程上读，载入开始前设好、结束后不再改 */
+    LoadProgressFn _onProgress;
 
     /**
      * 常驻 PCM 的所有权在这里，不在层结构里。
