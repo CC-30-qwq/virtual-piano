@@ -1,0 +1,74 @@
+
+#///////////////////////////
+# Cocos Creator 3D Project
+#///////////////////////////
+library/
+temp/
+local/
+build/
+profiles/
+
+#///////////////////////////
+# 原生工程 native/
+#///////////////////////////
+# 不能整体忽略 native/。
+# 按 Cocos《原生平台二次开发指南》，native/ 下的**项目代码必须入库**：
+#   - native/engine/common/Classes/   自研 C++（钢琴音频内核）
+#   - native/engine/common/*.cmake    CMake 接入配置
+#   - native/engine/android/          Java 胶水层、Gradle 配置（MIDI、Play Asset Delivery）
+# 这些文件不会随构建重新生成，丢了就没了。
+# 因此这里只排除构建产物，改为「跟踪 native/engine/，排除其下的中间产物」。
+
+native/*
+!native/engine/
+
+native/engine/**/build/
+native/engine/**/.gradle/
+native/engine/**/.cxx/
+native/engine/**/local.properties
+native/engine/**/*.iml
+
+# 非目标平台产物（本项目仅 Android），生成后不入库
+native/engine/ios/
+native/engine/mac/
+native/engine/windows/
+native/engine/linux/
+native/engine/ohos/
+
+#//////////////////////////
+# NPM / Python
+#//////////////////////////
+node_modules/
+# 音源流水线是 Python 脚本，会生成字节码缓存
+__pycache__/
+*.pyc
+
+#//////////////////////////
+# VSCode
+#//////////////////////////
+.vscode/
+
+#//////////////////////////
+# WebStorm
+#//////////////////////////
+.idea/
+
+#//////////////////////////
+# 音源原始素材
+#//////////////////////////
+# 约 714MB，由 tools/fetch-salamander.sh 获取。
+# 不入库：体积过大，且脚本可重新拉取（受限网络下走 jsDelivr CDN）。
+# M2 音源流水线处理后的产物另存，不在这里。
+audio-src/
+
+#//////////////////////////
+# C++ 内核测试的构建产物
+#//////////////////////////
+tests/cpp/.build/
+
+#//////////////////////////
+# 音源流水线产物
+#//////////////////////////
+# 由 tools/audio-pipeline/build_samples.py 生成，约数百 MB。
+# 不入库：可从 audio-src/ 重新生成，且最终会作为资源包分发。
+build-bank/

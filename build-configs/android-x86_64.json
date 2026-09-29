@@ -1,0 +1,21 @@
+{
+  "platform": "android",
+  "debug": true,
+  "startScene": "f3a91c62-5d47-4e18-9b02-7c1a4e6d8f30",
+  "packages": {
+    "android": {
+      "packageName": "com.virtualpiano.app",
+      "sdkPath": "C:\\Users\\10258\\AppData\\Local\\Android\\Sdk",
+      "ndkPath": "C:\\Users\\10258\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358",
+      "javaHome": "D:\\jdk-17.0.20.1+1",
+      "apiLevel": 36,
+      "appABIs": ["x86_64"],
+      "orientation": {
+        "portrait": false,
+        "upsideDown": false,
+        "landscapeLeft": true,
+        "landscapeRight": true
+      }
+    }
+  }
+}

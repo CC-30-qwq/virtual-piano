@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# 运行工程内全部可自动化的测试。
+#
+# 工程没有 node 环境和测试框架，但 Cocos 编辑器自带的 node 与 TypeScript
+# 可以直接用 —— ELECTRON_RUN_AS_NODE=1 会让 CocosCreator.exe 以纯 node 运行。
+# 因此不需要额外安装任何东西。
+#
+# 用法：  bash tests/run.sh
+#
+# 覆盖范围：不依赖 Cocos 运行时的纯逻辑。
+# 带 cc 依赖的代码（渲染、触摸）只能在编辑器或真机里验证。
+
+set -u
+
+CC="${COCOS_CREATOR:-D:/Cocos/editors/Creator/3.8.8/CocosCreator.exe}"
+TSC="${COCOS_TSC:-D:/Cocos/editors/Creator/3.8.8/resources/app.asar.unpacked/node_modules/typescript/lib/tsc.js}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${TMPDIR:-/tmp}/piano-tests"
+
+if [ ! -f "$CC" ]; then
+    echo "找不到 CocosCreator.exe：$CC" >&2
+    echo "可通过环境变量 COCOS_CREATOR 指定路径" >&2
+    exit 2
+fi
+
+node_run() { ELECTRON_RUN_AS_NODE=1 "$CC" "$@"; }
+
+failed=0
+
+# ---------------------------------------------------------------- 类型检查
+echo "========== 类型检查 =========="
+if ! node_run "$TSC" --noEmit -p "$ROOT/tsconfig.json"; then
+    echo "类型检查未通过"
+    failed=1
+fi
+echo
+
+# ---------------------------------------------------------------- 纯逻辑测试
+# PianoTypes.ts 与 KeyLayout.ts 都不 import cc，可以单独编译到 node 下运行。
+rm -rf "$OUT" && mkdir -p "$OUT"
+
+node_run "$TSC" \
+    "$ROOT/assets/scripts/keyboard/KeyLayout.ts" \
+    "$ROOT/assets/scripts/audio/PianoTypes.ts" \
+    --outDir "$OUT" --module commonjs --target es2020 --skipLibCheck || {
+        echo "编译测试目标失败" >&2
+        exit 2
+    }
+
+# tsc 会按源码的相对目录结构输出，拍平到同一层便于测试文件 require
+cp "$OUT"/audio/PianoTypes.js "$OUT"/keyboard/KeyLayout.js "$OUT"/ 2>/dev/null
+cp "$ROOT"/tests/*.test.js "$OUT"/
+
+for t in "$OUT"/*.test.js; do
+    name="$(basename "$t")"
+    echo "========== $name =========="
+    if ! (cd "$OUT" && node_run "$name"); then
+        failed=1
+    fi
+    echo
+done
+
+if [ "$failed" -ne 0 ]; then
+    echo "存在失败项"
+    exit 1
+fi
+echo "全部通过"

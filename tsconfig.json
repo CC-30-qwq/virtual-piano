@@ -1,0 +1,14 @@
+{
+  /* Base configuration. Do not edit this field. */
+  "extends": "./temp/tsconfig.cocos.json",
+
+  /* Add your custom configuration here. */
+  "compilerOptions": {
+    "strict": false,
+
+    /* 引擎自带的 cc.d.ts / jsb.d.ts 依赖 DOM、WebGPU 与 pal/* 等本工程未引入的
+       类型，直接检查会产生约 60 个与业务代码无关的报错。跳过声明文件检查后，
+       类型检查结果就只剩我们自己代码的问题，可以直接当 CI 关卡用。 */
+    "skipLibCheck": true
+  }
+}
