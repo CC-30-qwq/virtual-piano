@@ -9,8 +9,18 @@ const COLOR_BLACK_KEY = new Color(28, 28, 32, 255);
 /** 按下的白键：淡蓝灰，模拟琴键下沉的反光变化 */
 const COLOR_WHITE_PRESSED = new Color(168, 200, 232, 255);
 const COLOR_BLACK_PRESSED = new Color(72, 108, 152, 255);
-/** 键缝 */
-const COLOR_SEPARATOR = new Color(140, 140, 145, 255);
+/**
+ * 白键分隔线的默认颜色。
+ *
+ * 压在白键（250,250,248）上要有足够对比才看得见 —— 之前的 (140,140,145)
+ * 偏浅，实际渲染出来几乎看不出键与键的边界。
+ */
+const COLOR_SEPARATOR = new Color(120, 122, 130, 255);
+
+/** 键宽下限。低于此值手指按不准，再小就没有意义 */
+export const MIN_KEY_WIDTH = 22;
+/** 键宽上限。再宽就看不清整体音域了 */
+export const MAX_KEY_WIDTH = 48;
 
 /**
  * 88 键横屏键盘 —— 渲染与状态。
@@ -51,6 +61,18 @@ export class KeyboardView extends Component {
      */
     @property({ tooltip: '让 88 键恰好铺满屏幕宽度（滚动手势未实现前应保持开启）' })
     fitToScreen = true;
+
+    /**
+     * 白键分隔线宽度（pt）。设成 0 就不画。
+     *
+     * 做成属性而不是常量，是为了能在编辑器里直接调 —— 「一点点」这种
+     * 程度只能看着改，写成常量每次都要改代码再重跑。
+     */
+    @property({ tooltip: '白键分隔线宽度（pt），0 表示不画' })
+    whiteKeyOutlineWidth = 1;
+
+    @property({ tooltip: '白键分隔线颜色' })
+    whiteKeyOutlineColor = COLOR_SEPARATOR.clone();
 
     private _layout!: KeyLayout;
     private _baseLayer!: Graphics;
@@ -201,6 +223,49 @@ export class KeyboardView extends Component {
         this.scrollTo(this._layout.offsetToCenter(midi, this._viewportWidth));
     }
 
+    /**
+     * 手动设置键宽（缩放）。
+     *
+     * 会**关闭 `fitToScreen`** —— 用户主动缩放之后，就不该再被自动铺满覆盖掉。
+     *
+     * @param width  期望键宽，会夹到 [MIN_KEY_WIDTH, MAX_KEY_WIDTH]
+     * @param anchorRatio 缩放锚点：视口内的相对位置（0=左边缘，0.5=中心，1=右边缘）。
+     *        缩放时保持该位置对应的琴键不动 —— 否则画面会自己飘走，手感很差。
+     */
+    setKeyWidth(width: number, anchorRatio = 0.5): void {
+        const clamped = Math.min(MAX_KEY_WIDTH, Math.max(MIN_KEY_WIDTH, width));
+        if (Math.abs(clamped - this.keyWidth) < 0.01) {
+            return;
+        }
+
+        this.fitToScreen = false;
+
+        // 记下锚点处当前对应的「键盘内容坐标」，缩放后让它回到同一屏幕位置
+        const anchorRatioClamped = Math.min(1, Math.max(0, anchorRatio));
+        const anchorScreenX = this._viewportWidth * anchorRatioClamped;
+        const anchorContentX = anchorScreenX - this._offsetX;
+
+        const scale = clamped / this.keyWidth;
+        this.keyWidth = clamped;
+
+        this.rebuild();
+
+        this.scrollTo(anchorScreenX - anchorContentX * scale);
+    }
+
+    /** 当前是否由用户手动缩放过（即已脱离自动铺满） */
+    get manuallyZoomed(): boolean {
+        return !this.fitToScreen;
+    }
+
+    /** 恢复自动铺满 */
+    resetZoom(): void {
+        this.fitToScreen = true;
+        this.applyFit();
+        this.rebuild();
+        this.scrollTo(0);
+    }
+
     // ---------------------------------------------------------------- 绘制
 
     private drawBase(): void {
@@ -221,7 +286,14 @@ export class KeyboardView extends Component {
         }
         g.fill();
 
-        // 黑键后画，压在白键之上
+        // 分隔线画在白键之后、黑键之前。
+        //
+        // ⚠️ 顺序很关键：黑键**跨在白键的分界线上**，分隔线正好穿过它的正中间。
+        // 如果在黑键之后画，每个黑键上都会多出一道灰线；画在前面，黑键填色
+        // 自然就把该挡住的那段盖住了。
+        this.strokeSeparators(g, visible);
+
+        // 黑键最后画，压在白键与分隔线之上
         g.fillColor = COLOR_BLACK_KEY;
         for (const key of visible) {
             if (key.isBlack) {
@@ -229,23 +301,36 @@ export class KeyboardView extends Component {
             }
         }
         g.fill();
-
-        this.strokeSeparators(g, visible);
     }
 
     /**
-     * 键缝。
+     * 白键分隔线。
      *
-     * 只给白键描边 —— 黑键本身就靠明度对比区分，再描边会显得脏。
+     * 只给白键画 —— 黑键靠明度对比就已经分得开，再描边会显得脏。
+     *
+     * ## 为什么画竖线而不是描整圈矩形
+     *
+     * 描整圈会在白键顶部也画一道横线，而那里正是黑键所在的位置 ——
+     * 结果黑键顶上被切出一条灰线，像是没画完整。分隔线只需要表达
+     * 「相邻两键的边界」，那就是一条竖线，不需要整圈。
      */
     private strokeSeparators(g: Graphics, visible: readonly KeyGeometry[]): void {
-        g.strokeColor = COLOR_SEPARATOR;
-        g.lineWidth = 1;
+        if (this.whiteKeyOutlineWidth <= 0) {
+            return;   // 允许关掉
+        }
+
+        g.strokeColor = this.whiteKeyOutlineColor;
+        g.lineWidth = this.whiteKeyOutlineWidth;
+
+        // 每条边界画两次（左键的右边 + 右键的左边），画在同一位置，视觉上无差别
         for (const key of visible) {
             if (key.isBlack) {
                 continue;
             }
-            g.rect(key.x, 0, key.width, key.height);
+            g.moveTo(key.x, 0);
+            g.lineTo(key.x, key.height);
+            g.moveTo(key.x + key.width, 0);
+            g.lineTo(key.x + key.width, key.height);
         }
         g.stroke();
     }

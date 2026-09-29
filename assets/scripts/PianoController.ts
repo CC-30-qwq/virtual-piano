@@ -229,6 +229,19 @@ export class PianoController extends Component implements PianoInputListener {
             lines.push(`预览  ${engine.previewVoices} 个发声`);
         }
 
+        // 手势区的操作提示。
+        //
+        // 手势之所以放在键盘**上方**而不是琴键上：琴键上的手势已经被弹奏占满了
+        // （一指横划是滑奏、和弦本身就要多指），划不出「几指算手势」的边界。
+        // 放在空白区就没有歧义 —— 但用户不会自己发现，所以得写出来。
+        if (this._view) {
+            const mode = this._view.manuallyZoomed
+                ? `已缩放 · 键宽 ${this._view.keyWidth.toFixed(0)}pt`
+                : '自动铺满';
+            lines.push(`键盘  ${mode}`);
+            lines.push('手势  上方空白区：拖动平移 / 捏合缩放 / 双击复位');
+        }
+
         this._hudLabel!.string = lines.join('\n');
     }
 }
