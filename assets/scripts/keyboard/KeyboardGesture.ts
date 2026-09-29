@@ -1,5 +1,6 @@
 import { _decorator, Component, EventTouch, Node, Vec2, Vec3, UITransform } from 'cc';
-import { KeyboardView, MIN_KEY_WIDTH, MAX_KEY_WIDTH } from './KeyboardView';
+import { KeyboardView } from './KeyboardView';
+import { MIN_KEY_WIDTH, MAX_KEY_WIDTH } from './KeyboardViewport';
 
 const { ccclass, property } = _decorator;
 
@@ -98,6 +99,7 @@ export class KeyboardGesture extends Component {
         if (this._mode === 'none' || !this.keyboard) {
             return;
         }
+        const vp = this.keyboard.viewport;
 
         const centroid = this.centroid();
         const distance = this.spread();
@@ -105,7 +107,7 @@ export class KeyboardGesture extends Component {
         if (this._mode === 'pan') {
             // 一指（或多指等距）拖动：水平平移
             const dx = (centroid.x - this._lastCentroid.x) * this.panScale * (this.invertPan ? -1 : 1);
-            this.keyboard.scrollTo(this.keyboard.offsetX + dx);
+            vp.scrollBy(dx);
             if (Math.abs(dx) > 0.5) {
                 this._moved = true;
             }
@@ -115,21 +117,21 @@ export class KeyboardGesture extends Component {
 
             if (this._lastDistance > 1 && distance > 1) {
                 const ratio = distance / this._lastDistance;
-                const targetWidth = this.keyboard.keyWidth * Math.pow(ratio, this.zoomScale);
+                const targetWidth = vp.keyWidth * Math.pow(ratio, this.zoomScale);
 
-                // 锚点取两指中点在视口里的相对位置 —— 捏哪放大哪
-                const viewport = this.viewportWidth();
-                const anchorRatio = viewport > 0
-                    ? (this._lastCentroid.x - this.nodeWorldLeft()) / viewport
+                // 锚点取两指中点在视口里的相对位置 —— 捏哪放大哪。
+                //
+                // 分母用键盘视口的宽度，而不是手势区自己的宽度：两者横向范围一致
+                // （都由 Widget 铺满屏幕），但锚点比例是拿键盘视口解释的，语义上前者才对。
+                const width = vp.viewportWidth;
+                const anchorRatio = width > 0
+                    ? (this._lastCentroid.x - this.nodeWorldLeft()) / width
                     : 0.5;
 
-                this.keyboard.setKeyWidth(
-                    clamp(targetWidth, MIN_KEY_WIDTH, MAX_KEY_WIDTH),
-                    anchorRatio,
-                );
+                vp.setKeyWidth(clamp(targetWidth, MIN_KEY_WIDTH, MAX_KEY_WIDTH), anchorRatio);
             }
 
-            this.keyboard.scrollTo(this.keyboard.offsetX + dx);
+            vp.scrollBy(dx);
             this._moved = true;   // 捏合本身就是手势，不该被判成双击
         }
 
@@ -153,7 +155,7 @@ export class KeyboardGesture extends Component {
         if (this._points.size === 0 && !this._moved && this.keyboard) {
             const now = performance.now();
             if (now - this._lastTapAt < 300) {
-                this.keyboard.resetZoom();
+                this.keyboard.viewport.resetZoom();
                 this._lastTapAt = 0;
             } else {
                 this._lastTapAt = now;
@@ -217,11 +219,6 @@ export class KeyboardGesture extends Component {
             sum += Vec2.distance(p, c);
         }
         return sum / this._points.size;
-    }
-
-    private viewportWidth(): number {
-        const t = this.node.getComponent(UITransform);
-        return t ? t.width : 0;
     }
 
     /** 本节点世界范围的左边缘 x（UI 坐标）。锚点不同，换算也不同 */

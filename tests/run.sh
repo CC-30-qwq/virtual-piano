@@ -37,19 +37,33 @@ fi
 echo
 
 # ---------------------------------------------------------------- 纯逻辑测试
-# PianoTypes.ts 与 KeyLayout.ts 都不 import cc，可以单独编译到 node 下运行。
+# 下列文件都不 import cc，可以单独编译到 node 下运行：
+#   KeyLayout.ts         —— 键位几何
+#   KeyboardViewport.ts  —— 视口状态机（键宽/偏移/缩放锚点）
+#   KeyboardState.ts     —— 按下状态（随 KeyboardView 一起被编出来）
+#   KeyboardInput.ts     —— 触摸状态机（命中/力度/滑奏/防抖）
+#   PianoTypes.ts        —— 事件契约
+#   EventBatcher.ts      —— 攒批与时间戳（时钟与出口是注入的，见 AudioClock.ts）
+#   EventCodec.ts        —— 事件字节 → 字段
+# tsc 会顺着 import 把 AudioClock.ts、KeyboardViewport.ts、KeyboardState.ts 一起编出来。
+#
+# 产物按源码的相对目录结构摆放（keyboard/、audio/），**不做拍平** ——
+# 模块之间是用相对路径互相 require 的（例如 KeyboardInput 要
+# '../audio/PianoTypes'），拍平之后跨目录的相对路径就解析不到了。
 rm -rf "$OUT" && mkdir -p "$OUT"
 
 node_run "$TSC" \
     "$ROOT/assets/scripts/keyboard/KeyLayout.ts" \
+    "$ROOT/assets/scripts/keyboard/KeyboardViewport.ts" \
+    "$ROOT/assets/scripts/keyboard/KeyboardInput.ts" \
     "$ROOT/assets/scripts/audio/PianoTypes.ts" \
+    "$ROOT/assets/scripts/audio/EventBatcher.ts" \
+    "$ROOT/assets/scripts/audio/EventCodec.ts" \
+    "$ROOT/assets/scripts/audio/AudioClock.ts" \
     --outDir "$OUT" --module commonjs --target es2020 --skipLibCheck || {
         echo "编译测试目标失败" >&2
         exit 2
     }
-
-# tsc 会按源码的相对目录结构输出，拍平到同一层便于测试文件 require
-cp "$OUT"/audio/PianoTypes.js "$OUT"/keyboard/KeyLayout.js "$OUT"/ 2>/dev/null
 cp "$ROOT"/tests/*.test.js "$OUT"/
 
 for t in "$OUT"/*.test.js; do

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace piano {
@@ -31,6 +32,14 @@ enum class ParamId : uint16_t {
     PedalNoiseLevel = 10,  ///< 踏板噪音音量      0..1
     VelocityDepth   = 11,  ///< 力度动态范围      0..1
 };
+
+/**
+ * 参数 ID 的合法上界（= 参数个数），用于校验与数组定长。
+ *
+ * 与 `ParamId` 放在一起而不是留在用它的 .cpp 里 —— 新增参数时这两处必须同时改，
+ * 挨着写才不会漏。`ParamStore` 与 TS 侧的 `ParamId` 都依赖它。
+ */
+constexpr size_t kParamCount = static_cast<size_t>(ParamId::VelocityDepth) + 1;
 
 /**
  * 复音上限。

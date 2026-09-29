@@ -1,4 +1,4 @@
-const { KeyLayout, clampOffset, LOWEST_MIDI, HIGHEST_MIDI } = require('./KeyLayout.js');
+const { KeyLayout, clampOffset, LOWEST_MIDI, HIGHEST_MIDI } = require('./keyboard/KeyLayout.js');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) {

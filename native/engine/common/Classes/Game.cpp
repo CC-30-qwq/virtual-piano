@@ -28,9 +28,12 @@
 // ============================================================================
 // 钢琴音频内核的 JSB 绑定
 //
-// M0-3 时这里曾有一段「启动即播测试音」的临时钩子（用于验证真机出声）。
-// M0-4 接通 JSB 后已删除 —— 音频流的生命周期现在由 TS 侧经 `jsbPiano` 控制，
-// 见 assets/scripts/audio/PianoEngine.ts。
+// M0-3 时这里曾有一段「启动即播测试音」的临时钩子（`PIANO_M0_AUTOSTART`，
+// 用于验证真机出声）。它调用的是一个从未存在过的 `pianoEngineForTest()`，
+// 只因为宏没被定义过才一直没暴露 —— 已连同测试音一起删除（见 M0-3 的待办）。
+//
+// 音频流的启停现在由 TS 侧经 `jsbPiano` 控制，见 assets/scripts/audio/PianoEngine.ts；
+// 平台的暂停/恢复仍留在下面的生命周期钩子里（那是平台事件，见那里的说明）。
 // ============================================================================
 #include "PianoBridge.h"
 #include "PianoEngine.h"
@@ -71,17 +74,6 @@ int Game::init() {
   _xxteaKey = SCRIPT_XXTEAKEY;
 
   BaseGame::init();
-
-#if PIANO_M0_AUTOSTART
-  // 拉起音频流并开启测试音。失败只记日志 —— 音频起不来不应该影响应用启动。
-  {
-    piano::PianoEngine& piano = pianoEngineForTest();
-    if (piano.create()) {
-      piano.setTestTone(true);
-      piano.start();
-    }
-  }
-#endif
 
   return 0;
 }

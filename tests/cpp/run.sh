@@ -49,15 +49,29 @@ winpath() {
     printf '%s' "$1" | sed -e 's|^/\([a-zA-Z]\)/|\1:/|' -e 's|/|\\|g'
 }
 
-# 不依赖 Cocos 的内核源码。**新增文件必须加到这里** ——
-# 漏了的话它只会等到 Android 构建（几分钟）才被编译，
-# 一个拼写错误要等一场完整构建才发现。
-CORE_SOURCES=(
-    "$PIANO/EventQueue.cpp"
-    "$PIANO/SampleBank.cpp"
-    "$PIANO/Voice.cpp"
-    "$PIANO/VoicePool.cpp"
-)
+# 不依赖 Cocos 的内核源码清单。
+#
+# ⚠️ **不要在这里手写文件名** —— 清单的唯一来源是与 Android 构建共用的
+# pure_sources.cmake。曾经两处各写一遍，结果是新增内核 .cpp 时漏加任何一处
+# 都不立刻报错（漏在这边就是莫名其妙的链接失败）。
+PURE_LIST="$PIANO/pure_sources.cmake"
+if [ ! -f "$PURE_LIST" ]; then
+    echo "找不到源码清单：$PURE_LIST" >&2
+    exit 2
+fi
+
+CORE_SOURCES=()
+for name in $(sed -n '/set(PIANO_PURE_SOURCES/,/)/p' "$PURE_LIST" \
+                  | grep -v 'set(' | grep -v '^[[:space:]]*)$' | grep -v '^[[:space:]]*#') ; do
+    CORE_SOURCES+=("$PIANO/$name")
+done
+
+if [ "${#CORE_SOURCES[@]}" -eq 0 ]; then
+    echo "从 $PURE_LIST 里没解析出任何源码 —— 清单格式变了？" >&2
+    exit 2
+fi
+echo "内核源码 ${#CORE_SOURCES[@]} 个：$(basename -a "${CORE_SOURCES[@]}" | tr '\n' ' ')"
+echo
 
 rm -rf "$OUT" && mkdir -p "$OUT"
 

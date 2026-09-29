@@ -1,5 +1,7 @@
 import { _decorator, Component, Node, Graphics, Color, UITransform, Vec3 } from 'cc';
-import { KeyLayout, KeyGeometry, clampOffset } from './KeyLayout';
+import { KeyGeometry } from './KeyLayout';
+import { KeyboardState, KeyboardStateListener } from './KeyboardState';
+import { KeyboardViewport, ViewportListener } from './KeyboardViewport';
 
 const { ccclass, property } = _decorator;
 
@@ -17,16 +19,14 @@ const COLOR_BLACK_PRESSED = new Color(72, 108, 152, 255);
  */
 const COLOR_SEPARATOR = new Color(120, 122, 130, 255);
 
-/** 键宽下限。低于此值手指按不准，再小就没有意义 */
-export const MIN_KEY_WIDTH = 22;
-/** 键宽上限。再宽就看不清整体音域了 */
-export const MAX_KEY_WIDTH = 48;
-
 /**
- * 88 键横屏键盘 —— 渲染与状态。
+ * 88 键横屏键盘 —— 渲染。
  *
- * 对应 M3-2。命中测试与力度计算不在这里（见 TouchRouter），
- * 本组件只负责「把一个 KeyLayout 画出来」和「记录哪些键是按下的」。
+ * 对应 M3-2。**只负责画**：键位几何、滚动偏移、缩放都在 `KeyboardViewport` 里，
+ * 命中测试与力度在 `TouchRouter` 里。
+ *
+ * 视口状态一变，视口类会回调 `onViewportChanged()`，那是「状态 → 画面」的唯一入口。
+ * 手势与外部代码改视口时不需要知道本组件要怎么动节点。
  *
  * ## 绘制方式
  *
@@ -36,15 +36,15 @@ export const MAX_KEY_WIDTH = 48;
  * 整屏在**一个** Graphics 里画（为什么不是两层，见 `_layer` 的说明）。
  */
 @ccclass('KeyboardView')
-export class KeyboardView extends Component {
+export class KeyboardView extends Component implements ViewportListener, KeyboardStateListener {
     /**
-     * 白键宽度（pt）。
+     * 初始白键宽度（pt）。
      *
-     * ⚠️ `fitToScreen` 为真时本值会被**按视口宽度覆盖** —— 那是默认行为，
-     * 因为横向滚动/缩放手势尚未实现，固定键宽会让右侧的键够不着。
-     * 将来接上缩放手势后，把 `fitToScreen` 关掉即可用这个值。
+     * ⚠️ 这只是**构造视口时的输入**：`fitToScreen` 为真时会被按视口宽度覆盖，
+     * 用户捏合缩放后也会变。**当前生效的键宽要读 `viewport.keyWidth`** ——
+     * 这个属性保留是为了能在编辑器里改初值，它不是权威值。
      */
-    @property({ tooltip: '白键宽度（pt）。fitToScreen 开启时会被自动计算覆盖' })
+    @property({ tooltip: '初始白键宽度（pt）。实际生效值见运行时 viewport.keyWidth' })
     keyWidth = 40;
 
     @property({ tooltip: '白键高度（pt）' })
@@ -54,10 +54,9 @@ export class KeyboardView extends Component {
      * 是否让 88 键恰好铺满屏幕宽度。
      *
      * 设计分辨率 1280 宽时，每个白键约 24.6pt —— 偏窄但能一屏弹完整个音域。
-     * 这是当前唯一可用的方案：横向拖动手势会和滑奏冲突，得多指手势才能区分，
-     * 而那部分（M3-6）还没做。
+     * 这是默认方案；用户捏合缩放或双击复位会改变它。
      */
-    @property({ tooltip: '让 88 键恰好铺满屏幕宽度（滚动手势未实现前应保持开启）' })
+    @property({ tooltip: '初始让 88 键恰好铺满屏幕宽度' })
     fitToScreen = true;
 
     /**
@@ -72,7 +71,15 @@ export class KeyboardView extends Component {
     @property({ tooltip: '白键分隔线颜色' })
     whiteKeyOutlineColor = COLOR_SEPARATOR.clone();
 
-    private _layout!: KeyLayout;
+    private _viewport!: KeyboardViewport;
+
+    /**
+     * 按下状态。**输入层写，这里只读**。
+     *
+     * 本组件订阅它来触发重绘，而不是让 TouchRouter 反过来调 `setPressed` ——
+     * 那样输入层就得知道「按下要去改哪个渲染组件」。
+     */
+    private _state = new KeyboardState();
 
     /**
      * 绘制层。
@@ -84,67 +91,67 @@ export class KeyboardView extends Component {
      * 代价只是每次按键状态变化重绘一次整屏 —— 一百多个矩形，完全可以接受。
      */
     private _layer!: Graphics;
-    private _pressed = new Set<number>();
-    private _offsetX = 0;
-    private _viewportWidth = 0;
     /**
      * 场景里摆放的位置。本节点是 Canvas 的子节点，原点在屏幕中心，
      * 因此滚动只能在此基准上叠加，不能直接覆写 position。
      */
     private _basePos = new Vec3();
 
-    /** 键位几何。TouchRouter 与力度计算都从这里取。 */
-    get layout(): KeyLayout {
-        return this._layout;
+    /** 视口状态机。`viewport.layout` 是绘制与命中测试共用的几何来源 */
+    get viewport(): KeyboardViewport {
+        return this._viewport;
+    }
+
+    /** 按下状态。输入层（TouchRouter）需要它来写入 */
+    get state(): KeyboardState {
+        return this._state;
     }
 
     protected onLoad(): void {
         this._basePos.set(this.node.position);
+        this._state.listener = this;
 
         // 视口宽度从父节点（KeyboardArea）取。它在 Canvas 的 __preload 里
         // 已由 Widget 完成对齐，而 __preload 一定早于 onLoad，所以这里拿到的
         // 是屏幕的实际宽度，不是场景里写的占位值。
         const parentTransform = this.node.parent?.getComponent(UITransform);
-        if (parentTransform) {
-            this._viewportWidth = parentTransform.width;
-        }
+        const viewportWidth = parentTransform ? parentTransform.width : 0;
 
-        this.applyFit();
-        this.rebuild();
-    }
-
-    /**
-     * 按视口宽度定键宽，让 52 个白键恰好铺满。
-     *
-     * 在 `rebuild()` **之前**调用 —— 键位几何是按 keyWidth 一次性算好的。
-     */
-    private applyFit(): void {
-        if (!this.fitToScreen || this._viewportWidth <= 0) {
-            return;
-        }
-        const fitted = this._viewportWidth / KeyLayout.WHITE_KEY_COUNT;
-        if (fitted > 0 && Math.abs(fitted - this.keyWidth) > 0.01) {
-            this.keyWidth = fitted;
-        }
-    }
-
-    /**
-     * 按当前 keyWidth / whiteKeyHeight 重建键面。
-     * 缩放键盘时调用。
-     */
-    rebuild(): void {
-        this._layout = new KeyLayout({
+        this._viewport = new KeyboardViewport({
+            viewportWidth,
             keyWidth: this.keyWidth,
             whiteKeyHeight: this.whiteKeyHeight,
+            fitToScreen: this.fitToScreen,
         });
+        this._viewport.listener = this;
 
-        if (!this._layer) {
-            this._layer = this.makeLayer('Keyboard');
+        this._layer = this.makeLayer('Keyboard');
+        this.onViewportChanged(true);
+    }
+
+    /**
+     * 视口状态变化 —— 全组件唯一的「状态 → 画面」入口。
+     *
+     * 偏移变化也必须重画：绘制按视口裁剪（`visibleRange`），偏移一变，
+     * 裁剪窗口里的键就换了。少画这一笔的症状是「拖动后一片空白，按一下才出现」。
+     */
+    onViewportChanged(geometryChanged: boolean): void {
+        if (geometryChanged) {
+            this.syncTransform();
+            // 几何变了，旧的按下高亮不再对应正确的键位
+            this._state.clear();
         }
+        this.applyScroll();
+        this.redraw();
+    }
 
-        this.syncTransform();
-        this._pressed.clear();
-        this.syncViewport();
+    /**
+     * 按下状态变了 —— 重绘。
+     *
+     * 状态机只在**真的变了**的时候通知（同一根手指在同一个键上滑来滑去
+     * 会连着来十几次 touchMove），所以这里不用再做去重。
+     */
+    onPressedChanged(): void {
         this.redraw();
     }
 
@@ -158,10 +165,15 @@ export class KeyboardView extends Component {
     private syncTransform(): void {
         const transform = this.node.getComponent(UITransform) ?? this.node.addComponent(UITransform);
         transform.setAnchorPoint(0, 0);
-        transform.setContentSize(this._layout.totalWidth, this.whiteKeyHeight);
+        transform.setContentSize(this._viewport.totalWidth, this._viewport.whiteKeyHeight);
     }
 
-    /** 创建一层 Graphics 子节点 */
+    /** 把滚动偏移叠加到场景摆放位置上 */
+    private applyScroll(): void {
+        this.node.setPosition(this._basePos.x + this._viewport.offsetX, this._basePos.y, this._basePos.z);
+    }
+
+    /** 创建绘制层 Graphics 子节点 */
     private makeLayer(name: string): Graphics {
         const node = new Node(name);
 
@@ -181,102 +193,12 @@ export class KeyboardView extends Component {
         return graphics;
     }
 
-    /**
-     * 视口变化时调用。键盘比视口宽则允许横向滚动，否则居中。
-     */
-    setViewport(width: number): void {
-        this._viewportWidth = width;
-
-        // 视口变了，键宽要跟着重算 —— 横竖屏切换、分屏都会走到这里。
-        // 只有键宽真的变了才重建，否则每帧调一次会把绘制层重建到没完。
-        const before = this.keyWidth;
-        this.applyFit();
-        if (Math.abs(this.keyWidth - before) > 0.01) {
-            this.rebuild();
-            return;
-        }
-
-        this.syncViewport();
-    }
-
-    private syncViewport(): void {
-        if (this._viewportWidth <= 0) {
-            return;
-        }
-        this._offsetX = clampOffset(this._offsetX, this._viewportWidth, this._layout.totalWidth);
-        this.applyScroll();
-    }
-
-    /** 把滚动偏移叠加到场景摆放位置上 */
-    private applyScroll(): void {
-        this.node.setPosition(this._basePos.x + this._offsetX, this._basePos.y, this._basePos.z);
-    }
-
-    /** 横向滚动。传入的是期望偏移，会自动夹到合法范围。 */
-    scrollTo(offsetX: number): void {
-        this._offsetX = clampOffset(offsetX, this._viewportWidth, this._layout.totalWidth);
-        this.applyScroll();
-    }
-
-    /** 当前滚动偏移 */
-    get offsetX(): number {
-        return this._offsetX;
-    }
-
-    /** 让某个音高居中 */
-    centerOn(midi: number): void {
-        this.scrollTo(this._layout.offsetToCenter(midi, this._viewportWidth));
-    }
-
-    /**
-     * 手动设置键宽（缩放）。
-     *
-     * 会**关闭 `fitToScreen`** —— 用户主动缩放之后，就不该再被自动铺满覆盖掉。
-     *
-     * @param width  期望键宽，会夹到 [MIN_KEY_WIDTH, MAX_KEY_WIDTH]
-     * @param anchorRatio 缩放锚点：视口内的相对位置（0=左边缘，0.5=中心，1=右边缘）。
-     *        缩放时保持该位置对应的琴键不动 —— 否则画面会自己飘走，手感很差。
-     */
-    setKeyWidth(width: number, anchorRatio = 0.5): void {
-        const clamped = Math.min(MAX_KEY_WIDTH, Math.max(MIN_KEY_WIDTH, width));
-        if (Math.abs(clamped - this.keyWidth) < 0.01) {
-            return;
-        }
-
-        this.fitToScreen = false;
-
-        // 记下锚点处当前对应的「键盘内容坐标」，缩放后让它回到同一屏幕位置
-        const anchorRatioClamped = Math.min(1, Math.max(0, anchorRatio));
-        const anchorScreenX = this._viewportWidth * anchorRatioClamped;
-        const anchorContentX = anchorScreenX - this._offsetX;
-
-        const scale = clamped / this.keyWidth;
-        this.keyWidth = clamped;
-
-        this.rebuild();
-
-        this.scrollTo(anchorScreenX - anchorContentX * scale);
-    }
-
-    /** 当前是否由用户手动缩放过（即已脱离自动铺满） */
-    get manuallyZoomed(): boolean {
-        return !this.fitToScreen;
-    }
-
-    /** 恢复自动铺满 */
-    resetZoom(): void {
-        this.fitToScreen = true;
-        this.applyFit();
-        this.rebuild();
-        this.scrollTo(0);
-    }
-
     // ---------------------------------------------------------------- 绘制
 
     /**
      * 重绘整屏。
      *
-     * 每次按键状态变化都整体重绘 —— 单层之下没有别的选择，也确实不需要：
+     * 每次按键状态或视口变化都整体重绘 —— 单层之下没有别的选择，也确实不需要：
      * 一百多个矩形重绘一次的开销，远小于维护两层之间顺序正确性的代价。
      *
      * ## 绘制顺序（不可调换）
@@ -293,14 +215,16 @@ export class KeyboardView extends Component {
         const g = this._layer;
         g.clear();
 
+        const layout = this._viewport.layout;
+
         // 视口裁剪：只画看得见的键
-        const [x0, x1] = this.visibleRange();
-        const visible = this._layout.getVisibleKeys(x0, x1);
+        const [x0, x1] = this._viewport.visibleRange();
+        const visible = layout.getVisibleKeys(x0, x1);
 
         // 按下的键直接换填充色，而不是在上面叠一层高亮。
         // 单层里没有「叠」这回事，换色天然不会波及压在它上面的黑键 ——
         // 正是这一点让两层方案可以被合掉。
-        const down = (key: KeyGeometry): boolean => this._pressed.has(key.midi);
+        const down = (key: KeyGeometry): boolean => this._state.has(key.midi);
 
         this.fillKeys(g, visible, (key) => !key.isBlack && !down(key), COLOR_WHITE_KEY);
         this.fillKeys(g, visible, (key) => !key.isBlack && down(key), COLOR_WHITE_PRESSED);
@@ -344,7 +268,7 @@ export class KeyboardView extends Component {
         pick: (key: KeyGeometry) => boolean,
         color: Color,
     ): void {
-        const whiteTop = this._layout.whiteKeyHeight;
+        const whiteTop = this._viewport.whiteKeyHeight;
 
         // 先挑出要画的键。空批次绝不能落到下面的 fill()
         const keys = visible.filter(pick);
@@ -392,43 +316,4 @@ export class KeyboardView extends Component {
         g.stroke();
     }
 
-    /**
-     * 当前视口对应的键盘内容坐标范围（左右各留一个键宽余量）。
-     *
-     * 基础层与按下层都要用它做裁剪，抽出来避免两处各算一遍、算得不一致。
-     */
-    private visibleRange(): [number, number] {
-        const x0 = -this._offsetX - this.keyWidth;
-        return [x0, x0 + this._viewportWidth + this.keyWidth * 2];
-    }
-
-    // ---------------------------------------------------------------- 按下状态
-
-    /** 设置某个键的按下状态。状态未变化时不会重绘。 */
-    setPressed(midi: number, pressed: boolean): void {
-        const changed = pressed ? !this._pressed.has(midi) : this._pressed.has(midi);
-        if (!changed) {
-            return;
-        }
-        if (pressed) {
-            this._pressed.add(midi);
-        } else {
-            this._pressed.delete(midi);
-        }
-        this.redraw();
-    }
-
-    /** 清空全部按下状态（如触摸被系统中断时）。 */
-    clearPressed(): void {
-        if (this._pressed.size === 0) {
-            return;
-        }
-        this._pressed.clear();
-        this.redraw();
-    }
-
-    /** 当前按下的键（只读） */
-    get pressedKeys(): ReadonlySet<number> {
-        return this._pressed;
-    }
 }

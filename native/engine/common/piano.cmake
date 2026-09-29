@@ -36,20 +36,31 @@
 
 set(PIANO_DIR ${CMAKE_CURRENT_LIST_DIR}/Classes/piano)
 
+# 不依赖 Cocos 的源码清单（与宿主测试共用同一份，见该文件里的说明）
+include(${PIANO_DIR}/pure_sources.cmake)
+
+# 纯头文件的模块列在这里只是为了让它们在 IDE 里可见（编译不需要）
 list(APPEND CC_COMMON_SOURCES
     ${PIANO_DIR}/PianoEvent.h
     ${PIANO_DIR}/PianoParams.h
+    ${PIANO_DIR}/BankModel.h
+    ${PIANO_DIR}/SampleSource.h
+    ${PIANO_DIR}/SamplePool.h
+    ${PIANO_DIR}/ManifestReader.h
+    ${PIANO_DIR}/Diagnostics.h
+    ${PIANO_DIR}/ParamStore.h
+    ${PIANO_DIR}/Resampler.h
+)
+
+# 不依赖 Cocos 的源码（清单见 pure_sources.cmake）
+foreach(src ${PIANO_PURE_SOURCES})
+    list(APPEND CC_COMMON_SOURCES ${PIANO_DIR}/${src})
+endforeach()
+
+# 依赖引擎/平台的部分
+list(APPEND CC_COMMON_SOURCES
     ${PIANO_DIR}/PianoEngine.h
     ${PIANO_DIR}/PianoEngine.cpp
-    ${PIANO_DIR}/EventQueue.h
-    ${PIANO_DIR}/EventQueue.cpp
-    ${PIANO_DIR}/SampleBank.h
-    ${PIANO_DIR}/SampleBank.cpp
-    ${PIANO_DIR}/Resampler.h
-    ${PIANO_DIR}/Voice.h
-    ${PIANO_DIR}/Voice.cpp
-    ${PIANO_DIR}/VoicePool.h
-    ${PIANO_DIR}/VoicePool.cpp
     ${PIANO_DIR}/SampleSourceAndroid.cpp
     ${PIANO_DIR}/AudioDevice.h
     ${PIANO_DIR}/AudioDeviceAAudio.cpp

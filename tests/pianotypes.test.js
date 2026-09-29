@@ -10,7 +10,7 @@
 const {
     EventType, EventSource, ParamId,
     EVENT_STRIDE, MAX_VOICES, EVENT_QUEUE_CAPACITY, EventWriter,
-} = require('./PianoTypes.js');
+} = require('./audio/PianoTypes.js');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) {

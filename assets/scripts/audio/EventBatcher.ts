@@ -1,4 +1,4 @@
-import { PianoEngine } from './PianoEngine';
+import { AudioClock, EventSink } from './AudioClock';
 import { EventType, EventSource, EventWriter } from './PianoTypes';
 
 /**
@@ -20,10 +20,18 @@ import { EventType, EventSource, EventWriter } from './PianoTypes';
  * ⚠️ Cocos 的 `EventTouch` **不暴露操作系统级的时间戳**，所以这里只能取
  * 「TS 收到事件的那一刻」。真机上的触摸分发延迟因此无法从时间戳里扣除，
  * 只能靠前瞻量与后续的延迟校准向导来补偿。
+ *
+ * ## 依赖是注入的
+ *
+ * 本类**不 import 任何 `cc` 模块**，音频时钟与事件出口都从构造函数传入
+ * （见 `AudioClock.ts`）。这样钳位、丢包、时钟换算这些真正容易错的地方
+ * 都能在宿主机上直接测（tests/eventbatcher.test.js）——
+ * 它们原先因为要拿到 `PianoEngine` 而只能靠真机验证。
  */
 export class EventBatcher {
     private readonly _writer = new EventWriter();
-    private readonly _engine: PianoEngine;
+    private readonly _sink: EventSink;
+    private readonly _clock: AudioClock;
 
     /** 前瞻量：事件时间戳相对当前时刻前推多少毫秒 */
     private _leadMs = 6;
@@ -34,8 +42,9 @@ export class EventBatcher {
     private _submittedTotal = 0;
     private _droppedTotal = 0;
 
-    constructor(engine: PianoEngine = PianoEngine.instance) {
-        this._engine = engine;
+    constructor(sink: EventSink, clock: AudioClock) {
+        this._sink = sink;
+        this._clock = clock;
     }
 
     /** 累计提交成功的事件数 */
@@ -70,9 +79,9 @@ export class EventBatcher {
      * 拿它做基准会把偏移算成一个巨大的负数。
      */
     calibrate(): void {
-        const audioMs = this._engine.getStreamTimeMs();
+        const audioMs = this._clock.streamTimeMs();
         if (audioMs > 0) {
-            this._clockOffsetMs = audioMs - performance.now();
+            this._clockOffsetMs = audioMs - this._clock.now();
             this._clockCalibrated = true;
         }
     }
@@ -83,7 +92,7 @@ export class EventBatcher {
             // 未校准（编辑器预览、音频未启动）：写 0 表示「立即发声」
             return 0;
         }
-        return performance.now() + this._clockOffsetMs + this._leadMs;
+        return this._clock.now() + this._clockOffsetMs + this._leadMs;
     }
 
     // ---------------------------------------------------------------- 写入
@@ -136,12 +145,12 @@ export class EventBatcher {
 
         // dispatchEvents 会挑当前可用的后端：原生优先，否则走浏览器预览后端。
         // 两条路读同一套事件布局，所以这里不需要分支。
-        const accepted = this._engine.dispatchEvents(this._writer.buffer, count);
+        const accepted = this._sink.dispatchEvents(this._writer.buffer, count);
         this._submittedTotal += accepted;
 
         // 后端还没就绪（音源解码中）时返回 0，这些事件确实没去处。
         // 不计入 dropped —— 编辑器预览下的启动瞬间属于预期，不是异常。
-        if (this._engine.available && accepted < count) {
+        if (this._sink.available && accepted < count) {
             this._droppedTotal += count - accepted;
         }
 

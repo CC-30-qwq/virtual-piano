@@ -131,10 +131,6 @@ double jsbGetConsumedEvents() {
     return static_cast<double>(sharedEngine().consumedEvents());
 }
 
-void jsbSetTestTone(int32_t enabled) {
-    sharedEngine().setTestTone(enabled != 0);
-}
-
 /**
  * 状态描述。诊断用 —— TS 侧把它显示在调试读数上，
  * 一眼就能看出是「没启动」还是「绑定断了」。
@@ -166,7 +162,6 @@ bool jsb_register_piano(se::Object* globalThis) {
         .staticFunction("getAcceptedEvents", &jsbGetAcceptedEvents)
         .staticFunction("getDroppedEvents", &jsbGetDroppedEvents)
         .staticFunction("getConsumedEvents", &jsbGetConsumedEvents)
-        .staticFunction("setTestTone", &jsbSetTestTone)
         .staticFunction("getStatus", &jsbGetStatus)
         .install(globalThis);
 

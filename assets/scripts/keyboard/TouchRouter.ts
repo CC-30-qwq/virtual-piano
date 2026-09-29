@@ -1,15 +1,9 @@
 import { _decorator, Camera, Canvas, Component, EventTouch, Node, UITransform, Vec3 } from 'cc';
-import { KeyLayout } from './KeyLayout';
-import { KeyboardView } from './KeyboardView';
 import { EventSource } from '../audio/PianoTypes';
+import { KeyboardInput, KeyboardInputParams, PianoInputListener } from './KeyboardInput';
+import { KeyboardView } from './KeyboardView';
 
 const { ccclass, property } = _decorator;
-
-/** 接收演奏事件的监听者。由控制器实现，后续接到 PianoEngine。 */
-export interface PianoInputListener {
-    onNoteOn(midi: number, velocity: number, source: EventSource): void;
-    onNoteOff(midi: number): void;
-}
 
 /** 触摸的本地坐标（键盘坐标系：原点在左下角，y 向上） */
 interface LocalPoint {
@@ -18,16 +12,30 @@ interface LocalPoint {
 }
 
 /**
- * 触摸路由 —— 命中测试、多点跟踪、力度、滑奏。
+ * 触摸适配层 —— 把 `EventTouch` 翻译成状态机的入参。
  *
- * 对应 M3-3 / M3-4 / M3-5。
+ * 对应 M3-3 / M3-4 / M3-5。**逻辑不在这里**：命中测试、力度、滑奏去抖、
+ * 多点跟踪都在 `KeyboardInput`（不依赖 `cc`，可在宿主机测试）。
+ * 本组件只做两件事：
  *
- * 挂在与 KeyboardView **同一个节点**上。该节点的锚点被 KeyboardView 钉在
+ *   1. 把屏幕像素坐标换算成键盘局部坐标（要相机，绕不开 `cc`）
+ *   2. 把触摸事件与当前时刻转发给状态机
+ *
+ * 挂在与 `KeyboardView` **同一个节点**上。该节点的锚点被 KeyboardView 钉在
  * 左下角，因此 `convertToNodeSpaceAR()` 的结果直接就是 KeyLayout 的坐标系，
  * 这里不需要做任何额外换算。
+ *
+ * ## 与 KeyboardView 的关系
+ *
+ * 它只从视图取两样东西：`viewport`（几何与滚动状态）和 `state`（按下状态）。
+ * 两者都是不依赖 `cc` 的纯对象，**本组件不再调用任何绘制方法** ——
+ * 按下高亮由 KeyboardView 自己订阅 `KeyboardState` 得到通知，
+ * 输入层不需要知道「按下要去重绘谁」。
  */
 @ccclass('TouchRouter')
-export class TouchRouter extends Component {
+export class TouchRouter extends Component implements KeyboardInputParams, PianoInputListener {
+    // 这些属性既是编辑器可调项，也是 KeyboardInputParams 的实现 ——
+    // 实现接口（而不是拷一份快照给状态机）是为了在编辑器里改数值立即生效。
     @property({ tooltip: '最小力度 0..1（按在琴键最靠里处）' })
     minVelocity = 0.25;
 
@@ -43,34 +51,24 @@ export class TouchRouter extends Component {
     @property({ tooltip: '滑奏防抖窗口（毫秒）：刚离开又立刻回到同一个键，视为手指在键缝上抖动' })
     glissandoDebounceMs = 30;
 
-    /** 演奏事件出口 */
+    /** 演奏事件出口。由控制器赋值（控制器随后又把它接到 EventBatcher） */
     listener: PianoInputListener | null = null;
 
-    private _view!: KeyboardView;
-    /**
-     * 累计收到的触摸事件数（不论是否命中）。
-     *
-     * 与「按住的键数」对照可区分两类故障：
-     *   - 事件数一直是 0  → 事件根本没送达（层级、坐标、节点可见性）
-     *   - 事件数在涨但没命中 → 送达了但命中测试落空（坐标换算、键位尺寸）
-     * 这两类的排查方向完全不同，混在一起看是查不出来的。
-     */
-    private _eventsSeen = 0;
-    /** touchId → 当前所在音高 */
-    private _active = new Map<number, number>();
+    private _input!: KeyboardInput;
     /** UI 相机。屏幕像素 → 世界坐标的换算需要它（见 toLocal） */
     private _uiCamera: Camera | null = null;
-    /** touchId → 最近一次因滑奏离开的音高，用于防抖 */
-    private _lastLeft = new Map<number, number>();
-    /** touchId → 最近一次切换的时刻 */
-    private _lastSwitchAt = new Map<number, number>();
     private _tmp = new Vec3();
 
     protected onLoad(): void {
-        this._view = this.getComponent(KeyboardView)!;
-        if (!this._view) {
+        const view = this.getComponent(KeyboardView);
+        if (!view) {
             throw new Error('TouchRouter 必须与 KeyboardView 挂在同一个节点上');
         }
+
+        // 只取「视口」与「按下状态」两个纯对象。第三个参数是本组件自己 ——
+        // 状态机把事件回调给它，再由它转发给 listener（listener 是后赋值的，
+        // 所以不能把 listener 直接交给状态机）。
+        this._input = new KeyboardInput(view.viewport, view.state, this, this);
 
         // 相机找不到的话坐标换算会退化（屏幕像素被当成世界坐标），
         // 表现是「按键位置全错」且没有任何报错。所以这里明确警告一次。
@@ -140,99 +138,31 @@ export class TouchRouter extends Component {
         return null;
     }
 
-    private hitTest(event: EventTouch): number | null {
-        const p = this.toLocal(event);
-        if (!p) {
-            return null;
-        }
-        return this._view.layout.hitTest(p.x, p.y);
-    }
-
-    /**
-     * 力度：按触点的纵向位置决定。
-     *
-     * 真实钢琴的琴键绕后端支点转动，手指落点离支点越远，杠杆比越大、声音越响。
-     * 映射到屏幕就是：**越靠近自己（y 越小）越响**。
-     *
-     * 用 `key.height` 而不是白键高度做归一化 —— 黑键更短，若用白键高度，
-     * 黑键的力度范围会被压缩到很窄的一段。
-     */
-    private velocityFor(event: EventTouch, midi: number): number {
-        if (this.fixedVelocity) {
-            return this.fixedVelocityValue;
-        }
-
-        const p = this.toLocal(event);
-        const key = this._view.layout.getKey(midi);
-        if (!p || !key || key.height <= 0) {
-            return this.fixedVelocityValue;
-        }
-
-        const keyBottom = key.isBlack ? this._view.layout.whiteKeyHeight - key.height : 0;
-        const t = clamp01(1 - (p.y - keyBottom) / key.height);
-        return this.minVelocity + (this.maxVelocity - this.minVelocity) * t;
-    }
-
-    // ---------------------------------------------------------------- 触摸
+    // ---------------------------------------------------------------- 触摸转发
 
     private onTouchStart(event: EventTouch): void {
-        this._eventsSeen++;
-
-        // getID() 的声明类型是 number | null。拿不到 id 就无法跟踪这根手指，
-        // 直接忽略 —— 否则它在 TOUCH_END 时也无从匹配，会留下挂住的音符。
+        // getID() 的声明类型是 number | null。拿不到 id 就无法跟踪这根手指。
         const id = event.getID();
-        if (id === null || this._active.has(id)) {
+        if (id === null) {
             return;
         }
-
-        const midi = this.hitTest(event);
-        if (midi === null) {
+        const p = this.toLocal(event);
+        if (!p) {
             return;
         }
-
-        this._active.set(id, midi);
-        this._lastSwitchAt.set(id, performance.now());
-        this._view.setPressed(midi, true);
-        this.listener?.onNoteOn(midi, this.velocityFor(event, midi), EventSource.Touch);
+        this._input.touchStart(id, p.x, p.y, performance.now());
     }
 
-    /**
-     * 滑奏：手指划过一个键就触发一个音。
-     *
-     * 防抖只针对一种情况 —— **刚离开某个键又在极短时间内回到它**。
-     * 这几乎一定是手指停在键缝上抖动，而不是有意滑奏。
-     * 反过来，正常的连续跨越新键一律立即响应，不做时间限流，
-     * 否则快速横扫会漏音（手感上表现为「糊」）。
-     */
     private onTouchMove(event: EventTouch): void {
         const id = event.getID();
         if (id === null) {
             return;
         }
-        const current = this._active.get(id);
-        if (current === undefined) {
+        const p = this.toLocal(event);
+        if (!p) {
             return;
         }
-
-        const midi = this.hitTest(event);
-        if (midi === null || midi === current) {
-            return;
-        }
-
-        const now = performance.now();
-        const lastSwitch = this._lastSwitchAt.get(id) ?? 0;
-        if (midi === this._lastLeft.get(id) && now - lastSwitch < this.glissandoDebounceMs) {
-            return;
-        }
-
-        this.listener?.onNoteOff(current);
-        this._view.setPressed(current, false);
-
-        this._lastLeft.set(id, current);
-        this._lastSwitchAt.set(id, now);
-        this._active.set(id, midi);
-        this._view.setPressed(midi, true);
-        this.listener?.onNoteOn(midi, this.velocityFor(event, midi), EventSource.Touch);
+        this._input.touchMove(id, p.x, p.y, performance.now());
     }
 
     private onTouchEnd(event: EventTouch): void {
@@ -240,15 +170,16 @@ export class TouchRouter extends Component {
         if (id === null) {
             return;
         }
-        const midi = this._active.get(id);
-        if (midi === undefined) {
-            return;
-        }
+        this._input.touchEnd(id);
+    }
 
-        this._active.delete(id);
-        this._lastLeft.delete(id);
-        this._lastSwitchAt.delete(id);
-        this._view.setPressed(midi, false);
+    // ---------------------------------------------------------------- 演奏事件转发
+
+    onNoteOn(midi: number, velocity: number, source: EventSource): void {
+        this.listener?.onNoteOn(midi, velocity, source);
+    }
+
+    onNoteOff(midi: number): void {
         this.listener?.onNoteOff(midi);
     }
 
@@ -256,30 +187,20 @@ export class TouchRouter extends Component {
 
     /** 当前按下的键数（用于诊断） */
     get activeTouchCount(): number {
-        return this._active.size;
+        return this._input.activeTouchCount;
     }
 
     /** 累计收到的触摸事件数（不论是否命中），用于诊断 */
     get eventsSeen(): number {
-        return this._eventsSeen;
+        return this._input.eventsSeen;
     }
 
     /** 释放全部发声中音符（来电、切后台等场景） */
     releaseAll(): void {
-        for (const midi of this._active.values()) {
-            this.listener?.onNoteOff(midi);
-            this._view.setPressed(midi, false);
-        }
-        this._active.clear();
-        this._lastLeft.clear();
-        this._lastSwitchAt.clear();
+        this._input.releaseAll();
     }
 
     protected onDisable(): void {
         this.releaseAll();
     }
-}
-
-function clamp01(v: number): number {
-    return v < 0 ? 0 : v > 1 ? 1 : v;
 }

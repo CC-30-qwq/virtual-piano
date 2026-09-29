@@ -1,9 +1,12 @@
-import { _decorator, Component, Node, Label, UITransform, Vec3, Color, Canvas, sys } from 'cc';
+import { _decorator, Component } from 'cc';
 import { KeyboardView } from './keyboard/KeyboardView';
-import { TouchRouter, PianoInputListener } from './keyboard/TouchRouter';
+import { TouchRouter } from './keyboard/TouchRouter';
+import { PianoInputListener } from './keyboard/KeyboardInput';
 import { EventBatcher } from './audio/EventBatcher';
+import { EngineAudioClock } from './audio/EngineAudioClock';
 import { PianoEngine } from './audio/PianoEngine';
 import { EventSource } from './audio/PianoTypes';
+import { DebugHud, HudSnapshot } from './ui/DebugHud';
 
 const { ccclass, property } = _decorator;
 
@@ -34,24 +37,17 @@ export class PianoController extends Component implements PianoInputListener {
     @property({ tooltip: '是否显示调试读数' })
     showDebugHud = true;
 
-    /**
-     * 播放 440Hz 测试音。
-     *
-     * ⚠️ 临时开关。采样器内核（M1）接入前，按键是没声音的 ——
-     * 打开它用来确认音频设备层与 JSB 链路真的通到了扬声器。
-     * 接入采样器后连同 C++ 侧的正弦一起删除。
-     */
-    @property({ tooltip: '播放 440Hz 测试音（采样器接入前用于验证音频链路）' })
-    testTone = false;
-
     private _view!: KeyboardView;
     private _router!: TouchRouter;
-    private readonly _batcher = new EventBatcher();
+
+    // _engine 必须声明在 _batcher 之前：字段初始化按书写顺序执行，
+    // _batcher 的构造要用到 _engine。
     private readonly _engine = PianoEngine.instance;
+    private readonly _batcher = new EventBatcher(this._engine, new EngineAudioClock(this._engine));
 
     /** 音源是否已载入。未载入时按键不会有声音 —— 读数据要能看出这一点 */
     private _bankReady = false;
-    private _hudLabel: Label | null = null;
+    private _hud: DebugHud | null = null;
     private _lastNoteText = '—';
     private _lastVelocity = 0;
     private readonly _heldNotes = new Set<number>();
@@ -67,17 +63,15 @@ export class PianoController extends Component implements PianoInputListener {
         this._router.listener = this;
 
         if (this.showDebugHud) {
-            this.buildHud();
+            // 读数挂在 Canvas 上而不是本节点的父节点 —— 后者是键盘容器（只有 180 高），
+            // 读数会被限制在那一条里，而且键盘滚动时还会跟着动。
+            this._hud = DebugHud.attach(this.node);
         }
 
         // 原生不可用时 create/start 返回 false，这里不视为错误 ——
         // 编辑器预览本来就没有音频，UI 仍应可以正常调试。
         this._engine.create();
         this._engine.start();
-
-        if (this.testTone) {
-            this._engine.setTestTone(true);
-        }
 
         // 音源载入是同步阻塞的（中端机几秒）。推迟到首帧渲染之后 ——
         // 直接写在 onLoad 里会卡住场景首帧，Android 上还可能被判定为 ANR。
@@ -89,7 +83,7 @@ export class PianoController extends Component implements PianoInputListener {
      * 调试读数上的「音源」一栏会显示当前状态。
      */
     private loadBank(): void {
-        if (!sys.isNative) {
+        if (this._engine.kind === 'web') {
             // 编辑器预览：音源已内嵌在脚本包里（PreviewBankData.ts），
             // 不走原生音源包。这里直接返回，免得在读数上误报「音源未载入」。
             return;
@@ -97,7 +91,7 @@ export class PianoController extends Component implements PianoInputListener {
 
         this._bankReady = this._engine.loadBank();
         if (this._bankReady) {
-            const mb = (this._engine.getResidentBytes() / 1024 / 1024).toFixed(0);
+            const mb = (this._engine.diagnostics().residentBytes / 1024 / 1024).toFixed(0);
             console.log(`[piano] 音源已载入，常驻 ${mb} MB`);
         } else {
             console.warn('[piano] 音源载入失败 —— 按键不会有声音。'
@@ -117,9 +111,7 @@ export class PianoController extends Component implements PianoInputListener {
         this._batcher.calibrate();
         this._batcher.flush();
 
-        if (this._hudLabel) {
-            this._refreshHud();
-        }
+        this._hud?.update(this.snapshot());
     }
 
     // ---------------------------------------------------------------- 演奏事件
@@ -150,98 +142,35 @@ export class PianoController extends Component implements PianoInputListener {
 
     // ---------------------------------------------------------------- 调试读数
 
-    /** 沿父链向上找挂 Canvas 组件的节点 */
-    private findCanvasNode(): Node | null {
-        let node: Node | null = this.node;
-        while (node) {
-            if (node.getComponent(Canvas)) {
-                return node;
-            }
-            node = node.parent;
-        }
-        return null;
-    }
+    /**
+     * 采集一屏读数所需的全部数据。
+     *
+     * 只**读**，不碰任何 UI —— 怎么排版、怎么措辞都是 `DebugHud` 的事。
+     * 这里保留在控制器里是因为它本来就是装配点：只有控制器同时持有这四样东西。
+     */
+    private snapshot(): HudSnapshot {
+        // 后端诊断是结构化数据，不是文案 —— 怎么排版是 DebugHud 的事
+        const backend = this._engine.diagnostics();
 
-    private buildHud(): void {
-        // 挂在 Canvas 上而不是 this.node.parent —— 后者是键盘容器（只有 180 高），
-        // 读数会被限制在那一条里，而且键盘滚动时还会跟着动。
-        const canvas = this.findCanvasNode();
-        if (!canvas) {
-            return;
-        }
-
-        const node = new Node('DebugHud');
-
-        // 同 KeyboardView.makeLayer：运行时创建的节点默认在 DEFAULT 层，
-        // UI 相机看不到那一层。不设这一步读数就是不显示。
-        node.layer = canvas.layer;
-
-        const transform = node.addComponent(UITransform);
-        transform.setAnchorPoint(0, 1);
-
-        const label = node.addComponent(Label);
-        label.useSystemFont = true;
-        label.fontSize = 22;
-        label.lineHeight = 30;
-        label.horizontalAlign = Label.HorizontalAlign.LEFT;
-        label.verticalAlign = Label.VerticalAlign.TOP;
-        label.color = new Color(220, 230, 240, 220);
-
-        canvas.addChild(node);
-
-        // 贴在画布左上角
-        const canvasTransform = canvas.getComponent(UITransform);
-        const left = canvasTransform ? -canvasTransform.width * 0.5 : -640;
-        const top = canvasTransform ? canvasTransform.height * 0.5 : 360;
-        node.setPosition(new Vec3(left + 20, top - 16, 0));
-
-        this._hudLabel = label;
-    }
-
-    private _refreshHud(): void {
-        const engine = this._engine;
-        const lines = [
-            `状态  ${engine.statusText}`,
-            `音符  ${this._lastNoteText}    力度 ${(this._lastVelocity * 127).toFixed(0)}/127`,
-            // 「事件」是收到的触摸总数（不论是否命中），「按住」是命中的键数。
-            // 事件不涨 = 事件没送达；事件涨而按住恒 0 = 命中测试落空。
-            `事件  ${this._router.eventsSeen}    按住 ${this._heldNotes.size}    命中 ${this._router.activeTouchCount}`,
-            `已提交 ${this._batcher.submittedTotal}    待提交 ${this._batcher.pending}    丢弃 ${this._batcher.droppedTotal}`,
-        ];
-
-        // 原生可用时补一行内核侧的真实数据 —— 与上面的 TS 侧统计对照，
-        // 「已提交」对不上就说明事件没走到原生层。
-        if (engine.available) {
-            const xrun = engine.getXrunCount();
-            lines.push(
-                `内核  收到 ${engine.getAcceptedEvents()}    发声 ${engine.getActiveVoices()}    欠载 ${xrun}` +
-                (xrun > 0 ? ' ⚠' : ''),
-            );
-            // 音源没载入时按键必然无声。把状态显示出来，免得把「没载入」
-            // 误判成「触摸没响应」。
-            const mb = engine.getResidentBytes() / 1024 / 1024;
-            lines.push(this._bankReady
-                ? `音源  已载入 ${mb.toFixed(0)} MB`
-                : '音源  ⚠ 未载入（按键无声）');
-        } else {
-            // 编辑器预览走浏览器后端，没有原生那套诊断量。
-            // 音源状态已经在第一行的 statusText 里了。
-            lines.push(`预览  ${engine.previewVoices} 个发声`);
-        }
-
-        // 手势区的操作提示。
-        //
-        // 手势之所以放在键盘**上方**而不是琴键上：琴键上的手势已经被弹奏占满了
-        // （一指横划是滑奏、和弦本身就要多指），划不出「几指算手势」的边界。
-        // 放在空白区就没有歧义 —— 但用户不会自己发现，所以得写出来。
-        if (this._view) {
-            const mode = this._view.manuallyZoomed
-                ? `已缩放 · 键宽 ${this._view.keyWidth.toFixed(0)}pt`
-                : '自动铺满';
-            lines.push(`键盘  ${mode}`);
-            lines.push('手势  上方空白区：拖动平移 / 捏合缩放 / 双击复位');
-        }
-
-        this._hudLabel!.string = lines.join('\n');
+        return {
+            engine: backend.status,
+            backendKind: backend.kind,
+            backend,
+            bankReady: this._bankReady,
+            lastNote: this._lastNoteText,
+            lastVelocity: this._lastVelocity,
+            eventsSeen: this._router.eventsSeen,
+            heldNotes: this._heldNotes.size,
+            activeTouches: this._router.activeTouchCount,
+            submitted: this._batcher.submittedTotal,
+            pending: this._batcher.pending,
+            dropped: this._batcher.droppedTotal,
+            keyboard: this._view
+                ? {
+                    keyWidth: this._view.viewport.keyWidth,
+                    manuallyZoomed: this._view.viewport.manuallyZoomed,
+                }
+                : null,
+        };
     }
 }
