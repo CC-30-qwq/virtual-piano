@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "正式包构建配置模板。真实配置在 android-release.json（含明文密码，已 gitignore）。",
+    "Cocos 的 configPath 机制不支持从环境变量读密码，明文写文件是唯一路径。",
+    "换机器时复制本文件为 android-release.json，填入自己的密钥库路径与密码。",
+    "签名相关字段最终会写进 build/android/proj/gradle.properties 的",
+    "RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD。"
+  ],
+  "platform": "android",
+  "debug": false,
+  "startScene": "<主场景 uuid，见 assets/scenes/Main.scene.meta>",
+  "packages": {
+    "android": {
+      "packageName": "com.virtualpiano.app",
+      "sdkPath": "C:\\Users\\<user>\\AppData\\Local\\Android\\Sdk",
+      "ndkPath": "C:\\Users\\<user>\\AppData\\Local\\Android\\Sdk\\ndk\\28.2.13676358",
+      "javaHome": "D:\\jdk-17.0.20.1+1",
+      "apiLevel": 36,
+      "appABIs": ["arm64-v8a"],
+      "orientation": {
+        "portrait": false,
+        "upsideDown": false,
+        "landscapeLeft": true,
+        "landscapeRight": true
+      },
+      "useDebugKeystore": false,
+      "keystorePath": "<绝对路径>\\build-configs\\keystore\\virtual-piano-release.jks",
+      "keystorePassword": "<STORE_PASS>",
+      "keystoreAlias": "virtualpiano",
+      "keystoreAliasPassword": "<KEY_PASS>"
+    }
+  }
+}

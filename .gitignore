@@ -78,3 +78,12 @@ tests/cpp/.bench/*.obj
 # 由 tools/audio-pipeline/build_samples.py 生成，约数百 MB。
 # 不入库：可从 audio-src/ 重新生成，且最终会作为资源包分发。
 build-bank/
+
+#//////////////////////////
+# 正式包签名材料
+#//////////////////////////
+# android-release.json 含明文密钥库密码 —— Cocos 的 configPath 机制不支持从
+# 环境变量读密码，明文写文件是唯一路径，因此只能靠忽略规则拦住。
+# 模板见 android-release.example.json。
+build-configs/keystore/
+build-configs/android-release.json

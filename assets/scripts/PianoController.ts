@@ -35,8 +35,11 @@ export function midiToName(midi: number): string {
  */
 @ccclass('PianoController')
 export class PianoController extends Component implements PianoInputListener {
+    // 默认关闭：正式包不应在屏幕上挂调试读数。
+    // 注意场景里的序列化值优先于这里的默认值 —— 内测需要看读数时，
+    // 在编辑器的 PianoController 组件上勾选，比改这行更省事，也不会被误提交。
     @property({ tooltip: '是否显示调试读数' })
-    showDebugHud = true;
+    showDebugHud = false;
 
     private _view!: KeyboardView;
     private _router!: TouchRouter;

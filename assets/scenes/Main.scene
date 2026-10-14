@@ -519,7 +519,7 @@
     },
     "_enabled": true,
     "__prefab": null,
-    "showDebugHud": true,
+    "showDebugHud": false,
     "_id": "r17PianoCtrl000000000A"
   },
   {
